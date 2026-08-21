@@ -1,0 +1,57 @@
+[package]
+name = "unifi-voucher-proxy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A scoped, auditable proxy for the UniFi Network Integration API. Holds your full-control API key so apps never see it."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sushidev-team/unifi-voucher-proxy"
+readme = "README.md"
+keywords = ["unifi", "ubiquiti", "voucher", "proxy", "hotspot"]
+categories = ["network-programming", "web-programming::http-server"]
+
+[dependencies]
+axum = "0.8"
+async-graphql = { version = "7", default-features = false, features = ["graphiql"] }
+async-graphql-axum = "7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "limit", "timeout"] }
+hyper = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+figment = { version = "0.10", features = ["toml", "env"] }
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["rand_core", "alloc"] }
+subtle = "2"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+thiserror = "2"
+governor = "0.7"
+humantime-serde = "1"
+
+[dev-dependencies]
+axum-test = "17"
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+wiremock = "0.6"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

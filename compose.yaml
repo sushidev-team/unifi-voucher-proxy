@@ -1,0 +1,20 @@
+services:
+  unifi-voucher-proxy:
+    image: ghcr.io/sushidev-team/unifi-voucher-proxy:latest
+    # Built locally until the image is published; `docker compose up --build`
+    # tags the local build with the name above.
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.toml:/etc/unifi-voucher-proxy/config.toml:ro
+    environment:
+      # Keep the controller key out of the config file and out of your backups.
+      UVP_CONTROLLER__API_KEY: ${UNIFI_API_KEY:?set UNIFI_API_KEY in .env}
+      UVP_LOG_FORMAT: json
+    # The process needs nothing but an outbound socket.
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true

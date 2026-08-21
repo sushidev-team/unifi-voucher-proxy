@@ -1,0 +1,59 @@
+# unifi-voucher-proxy — example configuration
+#
+# Copy to config.toml and edit. Anything here can also come from the
+# environment: UVP_ + the path in caps with __ between levels, e.g.
+# UVP_CONTROLLER__API_KEY. Env wins over the file, which is how you keep the
+# controller key out of version control and backups.
+
+[server]
+bind = "0.0.0.0:8080"
+upstream_timeout = "15s"
+max_body_bytes = 65536
+
+[controller]
+# Your UniFi console. Scheme optional.
+host = "192.168.1.1"
+
+# The full-control Integration API key (Network -> Control Plane -> Integrations).
+# Prefer passing this as UVP_CONTROLLER__API_KEY instead of writing it here.
+api_key = ""
+
+[controller.tls]
+# UniFi consoles ship a self-signed certificate, so ordinary verification fails.
+# Pin it instead: run
+#     unifi-voucher-proxy fetch-fingerprint --host 192.168.1.1
+# and paste the result. This is what stops anyone on your LAN from impersonating
+# the controller and collecting the API key.
+fingerprint_sha256 = ""
+
+# Only for first-run discovery. Leave false.
+# insecure_skip_verify = false
+
+# Ceilings that apply to every token. A token may tighten these, never raise them.
+[limits]
+max_vouchers_per_request = 10
+max_validity_minutes = 43200   # 30 days
+rate_limit_per_minute = 60     # 0 disables
+
+# One entry per client device. Generate with:
+#     unifi-voucher-proxy hash-token --name kitchen-ipad
+# The token itself is printed once and only its Argon2id hash is stored here, so
+# a stolen config file does not hand over working credentials.
+[[tokens]]
+name = "reception-iphone"
+hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE_ME"
+# List real site ids where you can — a token scoped to one site cannot even see
+# that the others exist.
+sites = ["*"]
+scopes = ["sites:read", "vouchers:read", "vouchers:create", "vouchers:revoke"]
+# Optional per-token tightening:
+# max_vouchers_per_request = 5
+# max_validity_minutes = 1440
+# rate_limit_per_minute = 20
+
+# A display that only needs to show existing vouchers:
+# [[tokens]]
+# name = "lobby-display"
+# hash = "$argon2id$..."
+# sites = ["66c2f1e9-4b3a-4f21-9d0e-1a2b3c4d5e6f"]
+# scopes = ["vouchers:read"]
