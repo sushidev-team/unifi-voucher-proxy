@@ -232,7 +232,9 @@ impl Config {
             figment = figment.merge(Toml::file(p));
         }
         let config: Config = figment
-            .merge(Env::prefixed("UVP_").split("__"))
+            // UVP_LOG and UVP_LOG_FORMAT steer tracing, not this struct, and
+            // `deny_unknown_fields` would otherwise refuse to start with them set.
+            .merge(Env::prefixed("UVP_").split("__").ignore(&["LOG", "LOG_FORMAT"]))
             .extract()
             .context("invalid configuration")?;
         config.validate()?;

@@ -146,6 +146,32 @@ hash = "{VALID_HASH}"
     assert_eq!(cfg.server.bind.to_string(), "127.0.0.1:7777");
 }
 
+#[test]
+fn the_logging_variables_are_not_mistaken_for_config() {
+    let _guard = env_lock();
+    let (_dir, path) = write(&format!(
+        r#"
+[controller]
+host = "192.168.1.1"
+api_key = "k"
+
+[[tokens]]
+name = "phone"
+hash = "{VALID_HASH}"
+"#
+    ));
+
+    // These steer tracing, not Config. `deny_unknown_fields` used to refuse to
+    // start with either set — which is what compose.yaml ships.
+    std::env::set_var("UVP_LOG_FORMAT", "json");
+    std::env::set_var("UVP_LOG", "debug");
+    let loaded = Config::load(Some(&path));
+    std::env::remove_var("UVP_LOG_FORMAT");
+    std::env::remove_var("UVP_LOG");
+
+    assert!(loaded.is_ok(), "{:?}", loaded.err());
+}
+
 // --- refusals --------------------------------------------------------------
 
 #[test]
