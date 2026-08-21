@@ -234,7 +234,11 @@ impl Config {
         let config: Config = figment
             // UVP_LOG and UVP_LOG_FORMAT steer tracing, not this struct, and
             // `deny_unknown_fields` would otherwise refuse to start with them set.
-            .merge(Env::prefixed("UVP_").split("__").ignore(&["LOG", "LOG_FORMAT"]))
+            .merge(
+                Env::prefixed("UVP_")
+                    .split("__")
+                    .ignore(&["LOG", "LOG_FORMAT"]),
+            )
             .extract()
             .context("invalid configuration")?;
         config.validate()?;
