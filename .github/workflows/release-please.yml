@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: release PR / tag
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.release.outputs.release_created }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # The image is built here rather than from a `push: tags` trigger: tags
+  # created with GITHUB_TOKEN do not start new workflow runs, so a tag-triggered
+  # build would silently never fire.
+  image:
+    name: image
+    needs: release-please
+    if: needs.release-please.outputs.released == 'true'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/image.yml
+    with:
+      push: true
+      version: ${{ needs.release-please.outputs.version }}

@@ -1,5 +1,7 @@
 # unifi-voucher-proxy
 
+For https://getvouchers.app
+
 **The API-key scope that UniFi does not give you.**
 
 A UniFi Network Integration API key inherits every right of the admin that
@@ -272,4 +274,4 @@ UVP_LOG_FORMAT=json
 
 ## License
 
-MIT OR Apache-2.0.
+MIT

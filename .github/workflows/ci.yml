@@ -15,7 +15,7 @@ jobs:
     name: test / lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -28,7 +28,7 @@ jobs:
     name: coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -51,7 +51,7 @@ jobs:
             --fail-under-lines 99 \
             --show-missing-lines \
             --lcov --output-path lcov.info
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: lcov
@@ -61,60 +61,24 @@ jobs:
     name: dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@v7
+      # No tagged release runs on node24 yet (v2.0.0 is node20, which the
+      # runner now force-upgrades and warns about). Pinned to the commit
+      # that fixed it; move back to a tag once one ships.
+      - uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # main, node24
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   docker:
     name: image
-    runs-on: ubuntu-latest
     needs: [test]
     permissions:
       contents: read
       packages: write
       id-token: write
       attestations: write
-    steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-
-      - id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      # Lets anyone verify that a pulled image really came from this repo and
-      # this commit — the whole premise is "do not just trust us".
-      - name: Attest provenance
-        if: github.event_name != 'pull_request'
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ghcr.io/${{ github.repository }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
+    uses: ./.github/workflows/image.yml
+    with:
+      # Branch and sha tags only. Versioned tags and `latest` come from the
+      # release pipeline — see .github/workflows/release-please.yml.
+      push: ${{ github.event_name != 'pull_request' }}
