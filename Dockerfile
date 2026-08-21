@@ -7,25 +7,31 @@ RUN apk add --no-cache musl-dev
 
 WORKDIR /build
 
+# `release` builds fast and is what CI and branch images use. `dist` adds fat
+# LTO for a ~2.6 MiB smaller binary and is what the release pipeline passes.
+ARG PROFILE=release
+
 # Dependencies first, so editing src/ does not re-download the world.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && \
     echo 'fn main() {}' > src/main.rs && \
     echo '' > src/lib.rs && \
-    cargo build --release --locked && \
+    cargo build --profile ${PROFILE} --locked && \
     rm -rf src
 
+# Note: tests/ is deliberately not copied. A release build never
+# compiles it, but a COPY here would invalidate this layer — and with it the
+# whole app build and LTO link — every time a test changes.
 COPY src ./src
-COPY tests ./tests
 # Touch so cargo notices the real sources replaced the stubs.
 RUN touch src/main.rs src/lib.rs && \
-    cargo build --release --locked && \
-    strip target/release/unifi-voucher-proxy
+    cargo build --profile ${PROFILE} --locked
 
 
 FROM scratch
 
-COPY --from=builder /build/target/release/unifi-voucher-proxy /usr/local/bin/unifi-voucher-proxy
+ARG PROFILE=release
+COPY --from=builder /build/target/${PROFILE}/unifi-voucher-proxy /usr/local/bin/unifi-voucher-proxy
 
 # 65532 is the conventional "nonroot" uid. No /etc/passwd is needed for a
 # numeric user, and the binary never writes to disk.

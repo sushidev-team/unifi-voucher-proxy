@@ -49,9 +49,18 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 wiremock = "0.6"
 
+# Everyday builds: CI, pull requests, `cargo build --release`, and the branch
+# images. Small (opt-level "z" is both smaller and faster to compile than 2
+# here) but without the LTO link that dominates build time.
 [profile.release]
 opt-level = "z"
-lto = true
-codegen-units = 1
 panic = "abort"
 strip = true
+
+# What actually ships. Fat LTO is worth ~2.6 MiB of binary and costs ~30s of
+# link time on every build — a good trade once per release, a bad one per
+# commit. codegen-units = 1 is in for the last 229 KiB; it is nearly free.
+[profile.dist]
+inherits = "release"
+lto = true
+codegen-units = 1

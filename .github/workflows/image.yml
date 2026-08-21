@@ -16,20 +16,30 @@ on:
         type: string
         default: ''
 
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
 jobs:
+  # One runner per architecture, each native. Building both platforms on a
+  # single amd64 runner means the arm64 half compiles under QEMU, and this
+  # crate's release profile (fat LTO, codegen-units = 1) is about the worst
+  # thing you can hand an emulator: minutes native, tens of minutes emulated.
   build:
-    name: build
-    runs-on: ubuntu-latest
+    name: build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
     steps:
-      # No ref: on a release run this workflow is called from the push that
-      # release-please tagged, so the default checkout is already that commit.
       - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
@@ -43,7 +53,74 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE }}
+
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Fat LTO only for what actually ships — see [profile.dist] in Cargo.toml.
+          build-args: PROFILE=${{ inputs.version != '' && 'dist' || 'release' }}
+          # Separate scopes, or the two runners evict each other's cache.
+          # A release build is a different profile, so it gets its own scope
+          # rather than evicting the everyday one.
+          cache-from: type=gha,scope=${{ matrix.platform }}-${{ inputs.version != '' && 'dist' || 'release' }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}-${{ inputs.version != '' && 'dist' || 'release' }}
+          # Push by digest only; the tags go on the manifest list in `merge`.
+          # A pull request builds for real but keeps the result in the cache.
+          outputs: ${{ inputs.push
+            && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE)
+            || 'type=cacheonly' }}
+
+      - name: Export digest
+        if: inputs.push
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest='${{ steps.build.outputs.digest }}'
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        if: inputs.push
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Stitches the two single-arch images into one multi-arch tag. This is where
+  # the version tags and `latest` are actually applied.
+  merge:
+    name: manifest
+    if: inputs.push
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
           # `latest` is moved deliberately below, only by a real release, so a
           # push to main can never become what `docker compose up` pulls.
           flavor: latest=false
@@ -54,23 +131,28 @@ jobs:
             type=ref,event=branch,enable=${{ inputs.version == '' }}
             type=sha
 
-      - id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: ${{ inputs.push }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Create manifest list
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # Word splitting is the point: both substitutions expand to argument
+          # lists (-t per tag, one ref per digest file).
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      - id: digest
+        name: Read the manifest digest
+        run: |
+          digest=$(docker buildx imagetools inspect '${{ env.IMAGE }}:${{ steps.meta.outputs.version }}' \
+            --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       # Lets anyone verify that a pulled image really came from this repo and
       # this commit — the whole premise is "do not just trust us".
       - name: Attest provenance
-        if: inputs.push
         uses: actions/attest-build-provenance@v4
         with:
-          subject-name: ghcr.io/${{ github.repository }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
           push-to-registry: true
