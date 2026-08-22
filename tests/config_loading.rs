@@ -108,7 +108,10 @@ rate_limit_per_minute = 5
     assert_eq!(cfg.server.bind.to_string(), "127.0.0.1:9000");
     assert_eq!(cfg.server.upstream_timeout.as_secs(), 30);
     assert!(cfg.server.graphql_playground);
-    assert_eq!(cfg.controller.tls.fingerprint_sha256.unwrap().len(), 64);
+    // A bare string still deserialises into the one-element list.
+    let pins = cfg.controller.tls.fingerprint_sha256.unwrap();
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].len(), 64);
 
     let t = &cfg.tokens[0];
     assert!(t.allows_site("site-a"));
@@ -545,4 +548,156 @@ expires_at = "2026-06-01T12:00:00Z"
     // "valid until" a time must not still work at that time.
     assert!(cfg.tokens[0].is_expired_at(at));
     assert!(!cfg.tokens[0].is_expired_at(at - time::Duration::seconds(1)));
+}
+
+// --- more than one certificate may legitimately be the controller ----------
+
+#[test]
+fn a_single_fingerprint_and_a_list_of_them_both_load() {
+    let _guard = env_lock();
+    let a = "a".repeat(64);
+    let b = "b".repeat(64);
+
+    let (_d1, single) = write(&format!(
+        r#"
+[controller]
+host = "192.168.1.1"
+api_key = "k"
+
+[controller.tls]
+fingerprint_sha256 = "{a}"
+
+[[tokens]]
+name = "phone"
+hash = "{VALID_HASH}"
+"#
+    ));
+    let (_d2, many) = write(&format!(
+        r#"
+[controller]
+host = "192.168.1.1"
+api_key = "k"
+
+[controller.tls]
+fingerprint_sha256 = ["{a}", "{b}"]
+
+[[tokens]]
+name = "phone"
+hash = "{VALID_HASH}"
+"#
+    ));
+
+    // The bare string is what every existing config uses and must keep working.
+    assert_eq!(
+        Config::load(Some(&single))
+            .unwrap()
+            .controller
+            .tls
+            .fingerprint_sha256
+            .unwrap(),
+        vec![a.clone()]
+    );
+    assert_eq!(
+        Config::load(Some(&many))
+            .unwrap()
+            .controller
+            .tls
+            .fingerprint_sha256
+            .unwrap(),
+        vec![a, b]
+    );
+}
+
+#[test]
+fn every_entry_in_the_list_has_to_be_a_real_fingerprint() {
+    let _guard = env_lock();
+    let good = "a".repeat(64);
+    let (_dir, path) = write(&format!(
+        r#"
+[controller]
+host = "192.168.1.1"
+api_key = "k"
+
+[controller.tls]
+fingerprint_sha256 = ["{good}", "obviously-not-a-fingerprint"]
+
+[[tokens]]
+name = "phone"
+hash = "{VALID_HASH}"
+"#
+    ));
+    // One good entry must not launder a bad one — a list widens which certs
+    // count, it does not relax what a fingerprint is.
+    let err = Config::load(Some(&path)).unwrap_err();
+    assert!(format!("{err:#}").contains("fingerprint"), "{err:#}");
+}
+
+#[test]
+fn an_empty_list_is_refused_rather_than_read_as_no_pinning() {
+    let _guard = env_lock();
+    let (_dir, path) = write(&format!(
+        r#"
+[controller]
+host = "192.168.1.1"
+api_key = "k"
+
+[controller.tls]
+fingerprint_sha256 = []
+
+[[tokens]]
+name = "phone"
+hash = "{VALID_HASH}"
+"#
+    ));
+    // Silently falling back to WebPKI would turn a typo into a downgrade.
+    let err = Config::load(Some(&path)).unwrap_err();
+    assert!(format!("{err:#}").contains("empty list"), "{err:#}");
+}
+
+#[test]
+fn the_insecure_warning_can_be_silenced_without_changing_what_is_checked() {
+    let _guard = env_lock();
+    let (_dir, path) = write(&format!(
+        r#"
+[controller]
+host = "192.168.1.1"
+api_key = "k"
+
+[controller.tls]
+insecure_skip_verify = true
+silence_insecure_warning = true
+
+[[tokens]]
+name = "phone"
+hash = "{VALID_HASH}"
+"#
+    ));
+    let cfg = Config::load(Some(&path)).unwrap();
+    assert!(cfg.controller.tls.silence_insecure_warning);
+    // The point of the flag is that it touches the log and nothing else.
+    assert!(cfg.controller.tls.insecure_skip_verify);
+    assert!(cfg.controller.tls.fingerprint_sha256.is_none());
+}
+
+#[test]
+fn silencing_the_warning_defaults_to_off() {
+    let _guard = env_lock();
+    let (_dir, path) = write(&format!(
+        r#"
+[controller]
+host = "192.168.1.1"
+api_key = "k"
+
+[[tokens]]
+name = "phone"
+hash = "{VALID_HASH}"
+"#
+    ));
+    assert!(
+        !Config::load(Some(&path))
+            .unwrap()
+            .controller
+            .tls
+            .silence_insecure_warning
+    );
 }

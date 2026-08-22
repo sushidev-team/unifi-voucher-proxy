@@ -99,8 +99,9 @@ async fn a_matching_fingerprint_is_accepted() {
         &controller(
             console.addr,
             TlsConfig {
-                fingerprint_sha256: Some(console.fingerprint.clone()),
+                fingerprint_sha256: Some(vec![console.fingerprint.clone()]),
                 insecure_skip_verify: false,
+                silence_insecure_warning: false,
                 allow_plaintext: false,
             },
         ),
@@ -122,8 +123,9 @@ async fn a_different_certificate_is_refused() {
         &controller(
             console.addr,
             TlsConfig {
-                fingerprint_sha256: Some(wrong),
+                fingerprint_sha256: Some(vec![wrong]),
                 insecure_skip_verify: false,
+                silence_insecure_warning: false,
                 allow_plaintext: false,
             },
         ),
@@ -156,8 +158,9 @@ async fn the_pin_survives_the_spellings_people_actually_paste() {
         &controller(
             console.addr,
             TlsConfig {
-                fingerprint_sha256: Some(format!("sha256:{colonized}")),
+                fingerprint_sha256: Some(vec![format!("sha256:{colonized}")]),
                 insecure_skip_verify: false,
+                silence_insecure_warning: false,
                 allow_plaintext: false,
             },
         ),
@@ -178,6 +181,7 @@ async fn insecure_mode_connects_to_anything() {
             TlsConfig {
                 fingerprint_sha256: None,
                 insecure_skip_verify: true,
+                silence_insecure_warning: false,
                 allow_plaintext: false,
             },
         ),
@@ -234,8 +238,9 @@ async fn a_malformed_pin_is_rejected_at_construction() {
         &controller(
             "127.0.0.1:9".parse().unwrap(),
             TlsConfig {
-                fingerprint_sha256: Some("not-a-fingerprint".into()),
+                fingerprint_sha256: Some(vec!["not-a-fingerprint".into()]),
                 insecure_skip_verify: false,
+                silence_insecure_warning: false,
                 allow_plaintext: false,
             },
         ),
@@ -270,8 +275,9 @@ async fn pinning_works_over_tls_1_2_as_well() {
         &controller(
             console.addr,
             TlsConfig {
-                fingerprint_sha256: Some(console.fingerprint.clone()),
+                fingerprint_sha256: Some(vec![console.fingerprint.clone()]),
                 insecure_skip_verify: false,
+                silence_insecure_warning: false,
                 allow_plaintext: false,
             },
         ),
@@ -293,8 +299,9 @@ async fn a_mismatch_is_caught_over_tls_1_2_too() {
         &controller(
             console.addr,
             TlsConfig {
-                fingerprint_sha256: Some("c".repeat(64)),
+                fingerprint_sha256: Some(vec!["c".repeat(64)]),
                 insecure_skip_verify: false,
+                silence_insecure_warning: false,
                 allow_plaintext: false,
             },
         ),
@@ -319,6 +326,7 @@ async fn insecure_mode_also_works_over_tls_1_2() {
             TlsConfig {
                 fingerprint_sha256: None,
                 insecure_skip_verify: true,
+                silence_insecure_warning: false,
                 allow_plaintext: false,
             },
         ),
@@ -343,4 +351,52 @@ async fn an_untrusted_certificate_says_how_to_fix_it() {
         err.to_string().contains("fetch-fingerprint"),
         "the error should point at the fix, got: {err}"
     );
+}
+
+#[tokio::test]
+async fn any_pin_in_the_list_is_enough_to_accept_the_console() {
+    let console = stub_console(r#"{"data":[{"id":"default","name":"Default"}]}"#, 200).await;
+
+    // The shape of a rotation: the certificate the console will move to is
+    // already pinned alongside the one it currently presents, so the swap does
+    // not need a config change at exactly the wrong moment.
+    let upstream = Upstream::new(
+        &controller(
+            console.addr,
+            TlsConfig {
+                fingerprint_sha256: Some(vec!["d".repeat(64), console.fingerprint.clone()]),
+                insecure_skip_verify: false,
+                silence_insecure_warning: false,
+                allow_plaintext: false,
+            },
+        ),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+
+    let body = upstream.list_sites().await.unwrap();
+    assert_eq!(body["data"][0]["id"], "default");
+}
+
+#[tokio::test]
+async fn a_list_that_does_not_contain_the_console_is_still_refused() {
+    let console = stub_console("{}", 200).await;
+
+    let upstream = Upstream::new(
+        &controller(
+            console.addr,
+            TlsConfig {
+                fingerprint_sha256: Some(vec!["d".repeat(64), "e".repeat(64)]),
+                insecure_skip_verify: false,
+                silence_insecure_warning: false,
+                allow_plaintext: false,
+            },
+        ),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+
+    // Several pins widen which certificates count, never whether they count.
+    let err = upstream.list_sites().await.unwrap_err();
+    assert!(err.to_string().contains("fingerprint mismatch"), "{err}");
 }

@@ -148,7 +148,7 @@ async fn serve(path: &Path) -> Result<()> {
 /// Configuration that works but weakens the guarantees is called out on every
 /// start, not silently accepted.
 fn warn_about_weak_settings(cfg: &Config) {
-    if cfg.controller.tls.insecure_skip_verify {
+    if cfg.controller.tls.insecure_skip_verify && !cfg.controller.tls.silence_insecure_warning {
         tracing::warn!(
             "controller.tls.insecure_skip_verify is on — the connection to the controller is \
              unauthenticated and an on-path attacker could capture the API key. Run \
@@ -289,7 +289,13 @@ fn check_config(path: &Path) -> Result<()> {
                 &cfg.controller.tls.fingerprint_sha256,
                 cfg.controller.tls.insecure_skip_verify,
             ) {
-                (Some(fp), _) => format!("pinned to {fp}"),
+                (Some(fps), _) => match fps.len() {
+                    1 => format!("pinned to {}", fps[0]),
+                    n => format!("pinned to any of {n}: {}", fps.join(", ")),
+                },
+                (None, true) if cfg.controller.tls.silence_insecure_warning => {
+                    "INSECURE — certificate not verified (startup warning silenced)".to_string()
+                }
                 (None, true) => "INSECURE — certificate not verified".to_string(),
                 (None, false) => "standard WebPKI verification".to_string(),
             }

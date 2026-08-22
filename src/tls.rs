@@ -45,7 +45,8 @@ fn provider() -> Arc<CryptoProvider> {
 /// the console legitimately means re-pinning, which is the intended friction.
 #[derive(Debug)]
 struct PinnedVerifier {
-    expected: String,
+    /// Every fingerprint that counts as "this is the controller". Usually one.
+    expected: Vec<String>,
     provider: Arc<CryptoProvider>,
 }
 
@@ -60,13 +61,14 @@ impl ServerCertVerifier for PinnedVerifier {
     ) -> Result<ServerCertVerified, TlsError> {
         let actual = fingerprint(end_entity);
         // Length-equal hex strings; a plain comparison leaks no useful timing
-        // signal because the expected value is not a secret.
-        if actual == self.expected {
+        // signal because the expected values are not secrets.
+        if self.expected.contains(&actual) {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(TlsError::General(format!(
                 "controller certificate fingerprint mismatch: pinned {}, presented {}",
-                self.expected, actual
+                self.expected.join(" or "),
+                actual
             )))
         }
     }
@@ -177,8 +179,12 @@ pub fn client_config(cfg: &TlsConfig) -> Result<ClientConfig> {
         .context("failed to select TLS protocol versions")?;
 
     if let Some(raw) = &cfg.fingerprint_sha256 {
-        let expected = normalize_fingerprint(raw)
-            .context("controller.tls.fingerprint_sha256 is not usable")?;
+        let expected = raw
+            .iter()
+            .map(|r| {
+                normalize_fingerprint(r).context("controller.tls.fingerprint_sha256 is not usable")
+            })
+            .collect::<Result<Vec<_>>>()?;
         return Ok(builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedVerifier { expected, provider }))

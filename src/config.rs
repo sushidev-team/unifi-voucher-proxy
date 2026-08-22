@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use figment::providers::{Env, Format, Toml};
 use figment::Figment;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use time::OffsetDateTime;
 
 use crate::secret::Secret;
@@ -62,16 +62,31 @@ pub struct ControllerConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
-    /// SHA-256 fingerprint of the controller's leaf certificate, hex encoded
-    /// (colons and `sha256:` prefix are tolerated). When set, the certificate
-    /// must match exactly — this is how you get a trustworthy channel to a box
-    /// that ships a self-signed cert.
-    pub fingerprint_sha256: Option<String>,
+    /// SHA-256 fingerprint(s) of the controller's leaf certificate, hex encoded
+    /// (colons and `sha256:` prefix are tolerated). When set, the presented
+    /// certificate must match one of them — this is how you get a trustworthy
+    /// channel to a box that ships a self-signed cert.
+    ///
+    /// Accepts a single string or a list. A list is for the cases where one
+    /// console legitimately answers with more than one certificate — UniFi OS
+    /// serves a different leaf depending on the name it is reached by, and a
+    /// planned rotation means both the old and the new one are valid for a
+    /// while. Every entry is still an exact pin; a list widens *which* certs
+    /// are accepted, never *whether* they are checked.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub fingerprint_sha256: Option<Vec<String>>,
     /// Accept any certificate. Requires no fingerprint to be set and is loudly
     /// warned about on every startup; provided only so first-run setup can
     /// discover the fingerprint.
     #[serde(default)]
     pub insecure_skip_verify: bool,
+    /// Suppress the per-start warning that `insecure_skip_verify` prints.
+    ///
+    /// The check stays off either way — this only silences the reminder, for an
+    /// operator who has weighed the risk and does not want it in the log on
+    /// every restart. It does nothing unless `insecure_skip_verify` is on.
+    #[serde(default)]
+    pub silence_insecure_warning: bool,
     /// Permit an `http://` controller URL, i.e. no TLS at all.
     ///
     /// A UniFi console always speaks HTTPS, so this exists for one shape only:
@@ -80,6 +95,24 @@ pub struct TlsConfig {
     /// proxy is that the full-control API key never travels in the clear.
     #[serde(default)]
     pub allow_plaintext: bool,
+}
+
+/// Accepts either `fingerprint_sha256 = "abc…"` or `fingerprint_sha256 = ["abc…", "def…"]`.
+///
+/// The single-string form is what every existing config and the README use, so
+/// it stays the documented shape; the list is an additive convenience.
+fn one_or_many<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<OneOrMany>::deserialize(d)? {
+        None => None,
+        Some(OneOrMany::One(s)) => Some(vec![s]),
+        Some(OneOrMany::Many(v)) => Some(v),
+    })
 }
 
 impl ControllerConfig {
@@ -339,9 +372,14 @@ impl Config {
         }
         // An empty pin is not a pin. `serve` catches this when it builds the
         // TLS config; catching it here means `check-config` agrees.
-        if let Some(fp) = &tls.fingerprint_sha256 {
-            crate::tls::normalize_fingerprint(fp)
-                .context("controller.tls.fingerprint_sha256 is not usable")?;
+        if let Some(fps) = &tls.fingerprint_sha256 {
+            if fps.is_empty() {
+                bail!("controller.tls.fingerprint_sha256 is an empty list — remove the key to fall back to WebPKI verification, or put a fingerprint in it");
+            }
+            for fp in fps {
+                crate::tls::normalize_fingerprint(fp)
+                    .context("controller.tls.fingerprint_sha256 is not usable")?;
+            }
         }
         Ok(())
     }
