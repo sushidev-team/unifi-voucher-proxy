@@ -208,6 +208,7 @@ mod tests {
             max_vouchers_per_request: None,
             max_validity_minutes: None,
             rate_limit_per_minute: None,
+            expires_at: None,
         }
     }
 

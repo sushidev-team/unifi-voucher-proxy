@@ -13,6 +13,12 @@ pub enum ProxyError {
     #[error("missing or invalid API key")]
     Unauthorized,
 
+    /// The token was recognised but has lapsed. Told apart from
+    /// [`Unauthorized`] on purpose: "your token expired" is actionable, while
+    /// "invalid key" sends the operator looking for a typo.
+    #[error("this token expired on {0}")]
+    TokenExpired(String),
+
     #[error("{0}")]
     Forbidden(String),
 
@@ -41,6 +47,7 @@ impl ProxyError {
     pub fn status(&self) -> StatusCode {
         match self {
             ProxyError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ProxyError::TokenExpired(_) => StatusCode::UNAUTHORIZED,
             ProxyError::Forbidden(_) => StatusCode::FORBIDDEN,
             ProxyError::NotAllowed => StatusCode::FORBIDDEN,
             ProxyError::BadRequest(_) => StatusCode::BAD_REQUEST,
@@ -55,6 +62,7 @@ impl ProxyError {
     pub fn kind(&self) -> &'static str {
         match self {
             ProxyError::Unauthorized => "unauthorized",
+            ProxyError::TokenExpired(_) => "token_expired",
             ProxyError::Forbidden(_) => "forbidden",
             ProxyError::NotAllowed => "not_allowed",
             ProxyError::BadRequest(_) => "bad_request",
@@ -92,6 +100,7 @@ mod tests {
     fn all_variants() -> Vec<ProxyError> {
         vec![
             ProxyError::Unauthorized,
+            ProxyError::TokenExpired("2026-01-01T00:00:00Z".into()),
             ProxyError::Forbidden("nope".into()),
             ProxyError::NotAllowed,
             ProxyError::BadRequest("bad".into()),
@@ -109,6 +118,7 @@ mod tests {
     fn every_variant_maps_to_a_status_and_a_kind() {
         let expected = [
             (StatusCode::UNAUTHORIZED, "unauthorized"),
+            (StatusCode::UNAUTHORIZED, "token_expired"),
             (StatusCode::FORBIDDEN, "forbidden"),
             (StatusCode::FORBIDDEN, "not_allowed"),
             (StatusCode::BAD_REQUEST, "bad_request"),

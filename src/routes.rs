@@ -146,10 +146,11 @@ async fn not_allowed(method: axum::http::Method, uri: axum::http::Uri) -> ProxyE
 
 async fn list_sites(State(state): State<SharedState>, caller: Caller) -> ProxyResult<Json<Value>> {
     let started = Instant::now();
+    let live = state.live();
     caller.require_scope(Scope::SitesRead)?;
-    caller.charge(&state.rate, "sites:list")?;
+    caller.charge(&live.rate, "sites:list")?;
 
-    let result = state.upstream.list_sites().await;
+    let result = live.upstream.list_sites().await;
     let filtered = result.map(|body| filter_sites(body, &caller));
     finish(&caller, "sites:list", None, None, None, started, filtered)
 }
@@ -180,11 +181,12 @@ async fn list_vouchers(
     Path(site): Path<String>,
 ) -> ProxyResult<Json<Value>> {
     let started = Instant::now();
+    let live = state.live();
     caller.require_scope(Scope::VouchersRead)?;
     caller.require_site(&site)?;
-    caller.charge(&state.rate, "vouchers:list")?;
+    caller.charge(&live.rate, "vouchers:list")?;
 
-    let result = state.upstream.list_vouchers(&site).await;
+    let result = live.upstream.list_vouchers(&site).await;
     finish(
         &caller,
         "vouchers:list",
@@ -203,14 +205,19 @@ async fn create_vouchers(
     Json(body): Json<Value>,
 ) -> ProxyResult<Json<Value>> {
     let started = Instant::now();
+    let live = state.live();
     caller.require_scope(Scope::VouchersCreate)?;
     caller.require_site(&site)?;
+    // Charged before the body is looked at, not after. Scope and site are fixed
+    // lookups a caller cannot make expensive; parsing and policy work on data
+    // the caller controls, so a client that only ever sends rejects would
+    // otherwise get that work for free.
+    caller.charge(&live.rate, "vouchers:create")?;
 
     let request = CreateVoucherRequest::parse(&body)?;
     request.enforce(caller.ceilings)?;
-    caller.charge(&state.rate, "vouchers:create")?;
 
-    let result = state
+    let result = live
         .upstream
         .create_vouchers(&site, &request.to_upstream_body()?)
         .await;
@@ -231,11 +238,12 @@ async fn delete_voucher(
     Path((site, voucher)): Path<(String, String)>,
 ) -> ProxyResult<Json<Value>> {
     let started = Instant::now();
+    let live = state.live();
     caller.require_scope(Scope::VouchersRevoke)?;
     caller.require_site(&site)?;
-    caller.charge(&state.rate, "vouchers:revoke")?;
+    caller.charge(&live.rate, "vouchers:revoke")?;
 
-    let result = state.upstream.delete_voucher(&site, &voucher).await;
+    let result = live.upstream.delete_voucher(&site, &voucher).await;
     finish(
         &caller,
         "vouchers:revoke",

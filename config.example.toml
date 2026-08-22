@@ -29,11 +29,24 @@ fingerprint_sha256 = ""
 # Only for first-run discovery. Leave false.
 # insecure_skip_verify = false
 
+# Permit an http:// controller URL, i.e. no TLS at all. A UniFi console always
+# speaks HTTPS, so the only sane use is a TLS-terminating sidecar on this host.
+# Without this a plaintext host is refused at startup, because an unencrypted
+# hop would put the full-control API key on the wire.
+# allow_plaintext = false
+
 # Ceilings that apply to every token. A token may tighten these, never raise them.
 [limits]
 max_vouchers_per_request = 10
 max_validity_minutes = 43200   # 30 days
 rate_limit_per_minute = 60     # 0 disables
+
+# Requests per minute per client IP, charged *before* authentication. Checking a
+# token runs Argon2 against every configured hash and a wrong token is never
+# cached, so this is what stops an unauthenticated caller from deciding how much
+# CPU the machine spends. It keys on the peer address: behind a reverse proxy
+# every client shares one, so let that proxy do this instead and set 0 here.
+rate_limit_per_ip_per_minute = 120
 
 # One entry per client device. Generate with:
 #     unifi-voucher-proxy hash-token --name kitchen-ipad

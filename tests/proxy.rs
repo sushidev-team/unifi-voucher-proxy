@@ -44,6 +44,7 @@ async fn harness(build: impl FnOnce(&mut TokenConfig)) -> Harness {
         max_vouchers_per_request: None,
         max_validity_minutes: None,
         rate_limit_per_minute: Some(0),
+        expires_at: None,
     };
     build(&mut token_cfg);
 
@@ -58,6 +59,7 @@ async fn harness(build: impl FnOnce(&mut TokenConfig)) -> Harness {
             max_vouchers_per_request: 10,
             max_validity_minutes: 1440,
             rate_limit_per_minute: 0,
+            rate_limit_per_ip_per_minute: 0,
         },
         tokens: vec![token_cfg],
     };
@@ -456,4 +458,267 @@ async fn a_wildcard_token_sees_the_site_list_unfiltered() {
         .add_header("x-api-key", &h.token)
         .await;
     assert_eq!(res.json::<Value>()["data"].as_array().unwrap().len(), 2);
+}
+
+// --- the pre-authentication budget -----------------------------------------
+
+/// Builds the proxy behind a real socket, so `ConnectInfo` — and with it the
+/// pre-authentication rate limit — is genuinely in play. The mocked transport
+/// carries no peer address, which is exactly the wiring these tests exist to
+/// prove.
+async fn ip_limited_harness(per_ip: u32) -> TestServer {
+    let upstream = MockServer::start().await;
+    let (_token, hash) = auth::generate_token().unwrap();
+
+    let cfg = Config {
+        server: ServerConfig::default(),
+        controller: ControllerConfig {
+            host: upstream.uri(),
+            api_key: Secret::new(UPSTREAM_KEY),
+            tls: TlsConfig::default(),
+        },
+        limits: Limits {
+            max_vouchers_per_request: 10,
+            max_validity_minutes: 1440,
+            rate_limit_per_minute: 0,
+            rate_limit_per_ip_per_minute: per_ip,
+        },
+        tokens: vec![TokenConfig {
+            name: "test-client".into(),
+            hash,
+            sites: vec!["*".into()],
+            scopes: vec![Scope::SitesRead],
+            max_vouchers_per_request: None,
+            max_validity_minutes: None,
+            rate_limit_per_minute: Some(0),
+            expires_at: None,
+        }],
+    };
+
+    let state = AppState::new(&cfg).unwrap();
+    let app = routes::router(state, cfg.server.max_body_bytes);
+    TestServer::builder()
+        .http_transport()
+        .build(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_flood_of_wrong_tokens_is_cut_off_before_it_can_spend_argon2_time() {
+    let server = ip_limited_harness(3).await;
+
+    // Verifying a wrong token costs a full Argon2 hash against every configured
+    // hash and is deliberately never cached, so this is the expensive path.
+    for i in 0..3 {
+        server
+            .get("/proxy/info")
+            .add_header("authorization", "Bearer uvp_wrong")
+            .await
+            .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+        assert!(i < 3);
+    }
+
+    // The fourth never reaches the verifier at all.
+    server
+        .get("/proxy/info")
+        .add_header("authorization", "Bearer uvp_wrong")
+        .await
+        .assert_status(axum::http::StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn the_liveness_probe_survives_that_flood() {
+    let server = ip_limited_harness(2).await;
+    for _ in 0..5 {
+        server
+            .get("/proxy/info")
+            .add_header("authorization", "Bearer uvp_wrong")
+            .await;
+    }
+    // `/healthz` takes no `Caller`, so an orchestrator does not get taken down
+    // with the proxy when someone floods it.
+    server.get("/healthz").await.assert_status_ok();
+}
+
+#[tokio::test]
+async fn a_budget_of_zero_means_the_limit_is_off() {
+    let server = ip_limited_harness(0).await;
+    for _ in 0..8 {
+        server
+            .get("/proxy/info")
+            .add_header("authorization", "Bearer uvp_wrong")
+            .await
+            .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    }
+}
+
+// --- tokens that lapse ------------------------------------------------------
+
+#[tokio::test]
+async fn a_token_that_has_lapsed_is_refused() {
+    let h = harness(|t| {
+        t.expires_at = Some(time::OffsetDateTime::now_utc() - time::Duration::hours(1));
+    })
+    .await;
+
+    let res = h
+        .server
+        .get("/proxy/info")
+        .add_header("authorization", format!("Bearer {}", h.token))
+        .await;
+    res.assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    // The deadline is told to the caller so a device can say why it stopped
+    // working, but nothing else about the configuration leaks.
+    let body: Value = res.json();
+    assert!(
+        body["message"].as_str().unwrap().contains("expired"),
+        "{body}"
+    );
+    assert!(!res.text().contains(&h.token));
+}
+
+#[tokio::test]
+async fn a_token_with_a_deadline_still_ahead_works_normally() {
+    let h = harness(|t| {
+        t.expires_at = Some(time::OffsetDateTime::now_utc() + time::Duration::days(30));
+    })
+    .await;
+
+    h.server
+        .get("/proxy/info")
+        .add_header("authorization", format!("Bearer {}", h.token))
+        .await
+        .assert_status_ok();
+}
+
+// --- reload -----------------------------------------------------------------
+
+/// Writes a config file that loads cleanly, with `count` tokens.
+fn config_file(dir: &std::path::Path, count: usize) -> std::path::PathBuf {
+    const HASH: &str =
+        "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHR2YWx1ZQ$aGFzaHZhbHVlaGVyZWFiY2RlZmdoaWprbG1ub3A";
+    let mut s = String::from(
+        r#"
+[controller]
+host = "192.168.1.1"
+api_key = "k"
+"#,
+    );
+    for i in 0..count {
+        s.push_str(&format!(
+            "\n[[tokens]]\nname = \"t{i}\"\nhash = \"{HASH}\"\n"
+        ));
+    }
+    let path = dir.join("config.toml");
+    std::fs::write(&path, s).unwrap();
+    path
+}
+
+#[test]
+fn a_reload_picks_up_the_new_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config_file(dir.path(), 1);
+
+    let cfg = unifi_voucher_proxy::config::Config::load(Some(&path)).unwrap();
+    let state = AppState::with_path(&cfg, Some(path.clone())).unwrap();
+    assert_eq!(state.live().token_count, 1);
+
+    config_file(dir.path(), 3);
+    assert_eq!(state.reload().unwrap(), 3);
+    assert_eq!(state.live().token_count, 3);
+}
+
+#[test]
+fn a_broken_config_is_rejected_and_the_running_one_keeps_serving() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config_file(dir.path(), 2);
+
+    let cfg = unifi_voucher_proxy::config::Config::load(Some(&path)).unwrap();
+    let state = AppState::with_path(&cfg, Some(path.clone())).unwrap();
+    assert_eq!(state.live().token_count, 2);
+
+    // A typo in a token entry must not be able to take a working proxy down.
+    std::fs::write(&path, "this is not toml at all [[[").unwrap();
+    let err = state.reload().unwrap_err();
+    assert!(
+        format!("{err:#}").contains("keeping the previous config"),
+        "{err:#}"
+    );
+    assert_eq!(
+        state.live().token_count,
+        2,
+        "the old configuration must still be serving"
+    );
+}
+
+#[test]
+fn there_is_nothing_to_reload_when_the_config_came_from_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config_file(dir.path(), 1);
+    let cfg = unifi_voucher_proxy::config::Config::load(Some(&path)).unwrap();
+
+    // Built without a path, so a SIGHUP has no file to re-read.
+    let state = AppState::new(&cfg).unwrap();
+    let err = state.reload().unwrap_err();
+    assert!(
+        format!("{err:#}").contains("no config file to reload"),
+        "{err:#}"
+    );
+}
+
+// --- what the quota actually bounds -----------------------------------------
+
+#[tokio::test]
+async fn a_rejected_body_still_costs_the_caller_its_quota() {
+    // One request per minute, so the first call is the only one that can pass.
+    let h = harness(|t| t.rate_limit_per_minute = Some(1)).await;
+
+    // Spend it on something the proxy refuses: an unknown property. This never
+    // reaches the controller, but it did make the proxy parse and police
+    // caller-supplied data, and that is work worth bounding.
+    let res = h
+        .server
+        .post(&format!("{API}/sites/default/hotspot/vouchers"))
+        .add_header("authorization", format!("Bearer {}", h.token))
+        .json(&json!({"name": "Guest", "timeLimitMinutes": 60, "somethingElse": "nope"}))
+        .await;
+    res.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+    // A well-formed request now finds the budget gone. Before the quota was
+    // charged ahead of parsing, a client could send rejects all day for free.
+    let res = h
+        .server
+        .post(&format!("{API}/sites/default/hotspot/vouchers"))
+        .add_header("authorization", format!("Bearer {}", h.token))
+        .json(&json!({"name": "Guest", "count": 1, "timeLimitMinutes": 60}))
+        .await;
+    res.assert_status(axum::http::StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn a_scope_refusal_is_free_because_the_caller_cannot_make_it_expensive() {
+    let h = harness(|t| {
+        t.rate_limit_per_minute = Some(1);
+        t.scopes = vec![Scope::SitesRead];
+    })
+    .await;
+
+    // No create scope: a constant-time lookup, refused without touching the
+    // body. Charging for it would punish a client for a misconfiguration it
+    // cannot see.
+    for _ in 0..3 {
+        h.server
+            .post(&format!("{API}/sites/default/hotspot/vouchers"))
+            .add_header("authorization", format!("Bearer {}", h.token))
+            .json(&json!({"name": "Guest", "count": 1, "timeLimitMinutes": 60}))
+            .await
+            .assert_status(axum::http::StatusCode::FORBIDDEN);
+    }
+
+    // The budget is untouched, so a call it *is* allowed to make still works.
+    h.server
+        .get("/proxy/info")
+        .add_header("authorization", format!("Bearer {}", h.token))
+        .await
+        .assert_status_ok();
 }

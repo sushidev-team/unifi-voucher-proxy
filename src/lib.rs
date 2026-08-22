@@ -11,6 +11,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod graphql;
+pub mod metrics;
 pub mod model;
 pub mod policy;
 pub mod ratelimit;

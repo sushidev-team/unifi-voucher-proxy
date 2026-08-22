@@ -137,12 +137,11 @@ impl Query {
     /// Sites this token may use. Sites outside its allowlist are not listed.
     async fn sites(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Site>> {
         let (state, caller) = ctx_parts(ctx)?;
+        let live = state.live();
         caller.require_scope(Scope::SitesRead).map_err(to_gql)?;
-        caller
-            .charge(&state.rate, "graphql:sites")
-            .map_err(to_gql)?;
+        caller.charge(&live.rate, "graphql:sites").map_err(to_gql)?;
 
-        let body = state.upstream.list_sites().await.map_err(to_gql)?;
+        let body = live.upstream.list_sites().await.map_err(to_gql)?;
         Ok(Site::list(&body)
             .into_iter()
             .filter(|s| caller.token.allows_site(&s.id))
@@ -156,13 +155,14 @@ impl Query {
         site_id: String,
     ) -> async_graphql::Result<Vec<Voucher>> {
         let (state, caller) = ctx_parts(ctx)?;
+        let live = state.live();
         caller.require_scope(Scope::VouchersRead).map_err(to_gql)?;
         caller.require_site(&site_id).map_err(to_gql)?;
         caller
-            .charge(&state.rate, "graphql:vouchers")
+            .charge(&live.rate, "graphql:vouchers")
             .map_err(to_gql)?;
 
-        let body = state
+        let body = live
             .upstream
             .list_vouchers(&site_id)
             .await
@@ -183,18 +183,21 @@ impl Mutation {
         input: CreateVoucherInput,
     ) -> async_graphql::Result<Vec<Voucher>> {
         let (state, caller) = ctx_parts(ctx)?;
+        let live = state.live();
         caller
             .require_scope(Scope::VouchersCreate)
             .map_err(to_gql)?;
         caller.require_site(&site_id).map_err(to_gql)?;
+        // Same ordering as the REST route: the quota is spent before policy
+        // looks at caller-supplied values, so a stream of rejects is not free.
+        caller
+            .charge(&live.rate, "graphql:createVouchers")
+            .map_err(to_gql)?;
 
         let request: CreateVoucherRequest = input.into();
         request.enforce(caller.ceilings).map_err(to_gql)?;
-        caller
-            .charge(&state.rate, "graphql:createVouchers")
-            .map_err(to_gql)?;
 
-        let body = state
+        let body = live
             .upstream
             .create_vouchers(&site_id, &request.to_upstream_body().map_err(to_gql)?)
             .await
@@ -210,16 +213,16 @@ impl Mutation {
         voucher_id: String,
     ) -> async_graphql::Result<RevokeResult> {
         let (state, caller) = ctx_parts(ctx)?;
+        let live = state.live();
         caller
             .require_scope(Scope::VouchersRevoke)
             .map_err(to_gql)?;
         caller.require_site(&site_id).map_err(to_gql)?;
         caller
-            .charge(&state.rate, "graphql:revokeVoucher")
+            .charge(&live.rate, "graphql:revokeVoucher")
             .map_err(to_gql)?;
 
-        state
-            .upstream
+        live.upstream
             .delete_voucher(&site_id, &voucher_id)
             .await
             .map_err(to_gql)?;

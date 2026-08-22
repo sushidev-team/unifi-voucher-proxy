@@ -373,3 +373,176 @@ fn a_config_can_come_entirely_from_the_environment() {
     let err = result.unwrap_err();
     assert!(err.to_string().contains("no tokens configured"), "{err}");
 }
+
+// --- the key must not travel in the clear ----------------------------------
+
+#[test]
+fn a_plaintext_controller_url_is_refused() {
+    let _guard = env_lock();
+    let (_dir, path) = write(&format!(
+        r#"
+[controller]
+host = "http://192.168.1.1"
+api_key = "k"
+
+[[tokens]]
+name = "phone"
+hash = "{VALID_HASH}"
+"#
+    ));
+    let err = Config::load(Some(&path)).unwrap_err().to_string();
+    assert!(err.contains("travel unencrypted"), "{err}");
+}
+
+#[test]
+fn plaintext_is_allowed_only_when_asked_for_in_so_many_words() {
+    let _guard = env_lock();
+    let (_dir, path) = write(&format!(
+        r#"
+[controller]
+host = "http://127.0.0.1:8443"
+api_key = "k"
+
+[controller.tls]
+allow_plaintext = true
+
+[[tokens]]
+name = "phone"
+hash = "{VALID_HASH}"
+"#
+    ));
+    let cfg = Config::load(Some(&path)).unwrap();
+    assert!(cfg.controller.is_plaintext());
+    assert!(cfg.controller.tls.allow_plaintext);
+}
+
+#[test]
+fn an_absent_scheme_still_means_https() {
+    let _guard = env_lock();
+    let (_dir, path) = write(&format!(
+        r#"
+[controller]
+host = "192.168.1.1"
+api_key = "k"
+
+[[tokens]]
+name = "phone"
+hash = "{VALID_HASH}"
+"#
+    ));
+    let cfg = Config::load(Some(&path)).unwrap();
+    assert!(!cfg.controller.is_plaintext());
+}
+
+#[test]
+fn an_empty_pin_is_refused_at_load_so_check_config_agrees_with_serve() {
+    let _guard = env_lock();
+    let (_dir, path) = write(&format!(
+        r#"
+[controller]
+host = "192.168.1.1"
+api_key = "k"
+
+[controller.tls]
+fingerprint_sha256 = ""
+
+[[tokens]]
+name = "phone"
+hash = "{VALID_HASH}"
+"#
+    ));
+    // Previously this loaded fine and `check-config` reported "pinned to",
+    // while `serve` refused it when it built the TLS config.
+    let err = Config::load(Some(&path)).unwrap_err();
+    assert!(format!("{err:#}").contains("fingerprint"), "{err:#}");
+}
+
+#[test]
+fn the_pre_auth_budget_defaults_to_on() {
+    let _guard = env_lock();
+    let (_dir, path) = write(&format!(
+        r#"
+[controller]
+host = "192.168.1.1"
+api_key = "k"
+
+[[tokens]]
+name = "phone"
+hash = "{VALID_HASH}"
+"#
+    ));
+    let cfg = Config::load(Some(&path)).unwrap();
+    assert!(
+        cfg.limits.rate_limit_per_ip_per_minute > 0,
+        "an unauthenticated flood must be bounded unless the operator opts out"
+    );
+}
+
+// --- token expiry ----------------------------------------------------------
+
+/// A token that lapses is refused from the moment it lapses, not at the next
+/// restart, so these are asserted at chosen instants rather than by sleeping.
+#[test]
+fn a_lapsed_token_reads_as_expired_and_a_future_one_does_not() {
+    let _guard = env_lock();
+    let (_dir, path) = write(&format!(
+        r#"
+[controller]
+host = "192.168.1.1"
+api_key = "k"
+
+[[tokens]]
+name = "seasonal"
+hash = "{VALID_HASH}"
+expires_at = "2026-01-01T00:00:00Z"
+
+[[tokens]]
+name = "long-lived"
+hash = "{VALID_HASH}"
+expires_at = "2099-01-01T00:00:00Z"
+
+[[tokens]]
+name = "permanent"
+hash = "{VALID_HASH}"
+"#
+    ));
+    let cfg = Config::load(Some(&path)).unwrap();
+    let now = time::macros::datetime!(2026 - 06 - 01 12:00:00 UTC);
+
+    let seasonal = &cfg.tokens[0];
+    let long_lived = &cfg.tokens[1];
+    let permanent = &cfg.tokens[2];
+
+    assert!(seasonal.is_expired_at(now));
+    assert!(!long_lived.is_expired_at(now));
+    // No expiry configured means it never lapses.
+    assert!(!permanent.is_expired_at(now));
+    assert!(permanent.expires_in(now).is_none());
+
+    // Already lapsed reads as negative, still valid as positive.
+    assert!(seasonal.expires_in(now).unwrap().is_negative());
+    assert!(long_lived.expires_in(now).unwrap().is_positive());
+}
+
+#[test]
+fn expiry_is_inclusive_of_the_instant_itself() {
+    let _guard = env_lock();
+    let (_dir, path) = write(&format!(
+        r#"
+[controller]
+host = "192.168.1.1"
+api_key = "k"
+
+[[tokens]]
+name = "exact"
+hash = "{VALID_HASH}"
+expires_at = "2026-06-01T12:00:00Z"
+"#
+    ));
+    let cfg = Config::load(Some(&path)).unwrap();
+    let at = time::macros::datetime!(2026 - 06 - 01 12:00:00 UTC);
+    // At the stroke of the deadline the token is already gone — a token that is
+    // "valid until" a time must not still work at that time.
+    assert!(cfg.tokens[0].is_expired_at(at));
+    assert!(!cfg.tokens[0].is_expired_at(at - time::Duration::seconds(1)));
+}

@@ -80,6 +80,7 @@ async fn harness(build: impl FnOnce(&mut TokenConfig)) -> Harness {
         max_vouchers_per_request: None,
         max_validity_minutes: None,
         rate_limit_per_minute: Some(0),
+        expires_at: None,
     };
     build(&mut token_cfg);
 
@@ -94,6 +95,7 @@ async fn harness(build: impl FnOnce(&mut TokenConfig)) -> Harness {
             max_vouchers_per_request: 10,
             max_validity_minutes: 1440,
             rate_limit_per_minute: 0,
+            rate_limit_per_ip_per_minute: 0,
         },
         tokens: vec![token_cfg],
     };
@@ -530,6 +532,7 @@ async fn the_playground_is_served_when_it_is_switched_on() {
             max_vouchers_per_request: None,
             max_validity_minutes: None,
             rate_limit_per_minute: Some(0),
+            expires_at: None,
         }],
     };
     let state = AppState::new(&cfg).unwrap();

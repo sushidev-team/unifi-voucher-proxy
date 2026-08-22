@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 use figment::providers::{Env, Format, Toml};
 use figment::Figment;
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::secret::Secret;
 
@@ -71,6 +72,22 @@ pub struct TlsConfig {
     /// discover the fingerprint.
     #[serde(default)]
     pub insecure_skip_verify: bool,
+    /// Permit an `http://` controller URL, i.e. no TLS at all.
+    ///
+    /// A UniFi console always speaks HTTPS, so this exists for one shape only:
+    /// a TLS-terminating sidecar on the loopback interface. Without it a
+    /// plaintext host is refused at startup, because the whole point of the
+    /// proxy is that the full-control API key never travels in the clear.
+    #[serde(default)]
+    pub allow_plaintext: bool,
+}
+
+impl ControllerConfig {
+    /// Whether the configured host disables TLS outright. An absent scheme
+    /// means https, so only an explicit `http://` counts.
+    pub fn is_plaintext(&self) -> bool {
+        self.host.trim().to_ascii_lowercase().starts_with("http://")
+    }
 }
 
 /// Ceilings applied to every request, before any per-token override.
@@ -84,6 +101,16 @@ pub struct Limits {
     /// Requests per minute per token. `0` disables rate limiting.
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_minute: u32,
+    /// Requests per minute per client IP, charged *before* authentication.
+    ///
+    /// Verifying a token costs a full Argon2 hash against every configured
+    /// token, and a wrong token is never cached — so without this an
+    /// unauthenticated caller can spend the machine's CPU at will. `0` disables
+    /// it, which is right only when something in front already limits by
+    /// source. Note the counter keys on the peer address: behind a reverse
+    /// proxy every client shares one, so let that proxy do this instead.
+    #[serde(default = "default_pre_auth_rate_limit")]
+    pub rate_limit_per_ip_per_minute: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,6 +128,14 @@ pub struct TokenConfig {
     pub max_vouchers_per_request: Option<u32>,
     pub max_validity_minutes: Option<u64>,
     pub rate_limit_per_minute: Option<u32>,
+
+    /// When this token stops working, as an RFC-3339 timestamp
+    /// (`2027-03-01T00:00:00Z`). Absent means it never expires.
+    ///
+    /// Expiry is checked per request rather than at startup, so a long-running
+    /// proxy stops honouring a token the moment it lapses — no restart needed.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 /// What a token may do.
@@ -145,6 +180,20 @@ impl TokenConfig {
         self.scopes.contains(&scope)
     }
 
+    /// Whether the token has lapsed as of [now].
+    ///
+    /// `now` is passed in rather than read from the clock so the behaviour can
+    /// be tested at chosen instants instead of by sleeping.
+    pub fn is_expired_at(&self, now: OffsetDateTime) -> bool {
+        self.expires_at.is_some_and(|t| now >= t)
+    }
+
+    /// How long until it lapses; `None` when it never does, negative when it
+    /// already has.
+    pub fn expires_in(&self, now: OffsetDateTime) -> Option<time::Duration> {
+        self.expires_at.map(|t| t - now)
+    }
+
     /// Effective ceiling: a token may tighten a global limit but never raise it.
     pub fn effective_max_vouchers(&self, global: &Limits) -> u32 {
         self.max_vouchers_per_request
@@ -184,6 +233,12 @@ fn default_max_vouchers() -> u32 {
 fn default_max_validity() -> u64 {
     60 * 24 * 30 // 30 days
 }
+/// Generous next to the per-token default of 60: this is a flood stop, not a
+/// quota, and it must not bite a client that is behaving.
+fn default_pre_auth_rate_limit() -> u32 {
+    120
+}
+
 fn default_rate_limit() -> u32 {
     60
 }
@@ -216,6 +271,7 @@ impl Default for Limits {
             max_vouchers_per_request: default_max_vouchers(),
             max_validity_minutes: default_max_validity(),
             rate_limit_per_minute: default_rate_limit(),
+            rate_limit_per_ip_per_minute: default_pre_auth_rate_limit(),
         }
     }
 }
@@ -271,6 +327,21 @@ impl Config {
             bail!(
                 "controller.tls: set either fingerprint_sha256 or insecure_skip_verify, not both"
             );
+        }
+        // A plaintext controller URL puts the full-control API key on the wire
+        // in the clear, which is precisely what this proxy exists to prevent.
+        // Refused unless the operator says otherwise in so many words.
+        if self.controller.is_plaintext() && !tls.allow_plaintext {
+            bail!(
+                "controller.host is {} — the API key would travel unencrypted. Use https://, or set controller.tls.allow_plaintext = true if a TLS-terminating sidecar on this host is doing the encryption",
+                self.controller.host.trim()
+            );
+        }
+        // An empty pin is not a pin. `serve` catches this when it builds the
+        // TLS config; catching it here means `check-config` agrees.
+        if let Some(fp) = &tls.fingerprint_sha256 {
+            crate::tls::normalize_fingerprint(fp)
+                .context("controller.tls.fingerprint_sha256 is not usable")?;
         }
         Ok(())
     }

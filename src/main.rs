@@ -133,10 +133,16 @@ async fn serve(path: &Path) -> Result<()> {
         env!("CARGO_PKG_VERSION")
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")
+    // `into_make_service_with_connect_info` is what puts the peer address in
+    // the request extensions; without it the pre-auth rate limit has no key to
+    // count against and silently does nothing.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("server error")
 }
 
 /// Configuration that works but weakens the guarantees is called out on every
@@ -147,6 +153,20 @@ fn warn_about_weak_settings(cfg: &Config) {
             "controller.tls.insecure_skip_verify is on — the connection to the controller is \
              unauthenticated and an on-path attacker could capture the API key. Run \
              `unifi-voucher-proxy fetch-fingerprint` and pin the certificate instead."
+        );
+    }
+    if cfg.controller.tls.allow_plaintext && cfg.controller.is_plaintext() {
+        tracing::warn!(
+            "controller.host is plaintext http:// and allow_plaintext is on — the full-control \
+             API key travels unencrypted. This is only safe if a TLS-terminating sidecar on this \
+             host is doing the encryption."
+        );
+    }
+    if cfg.limits.rate_limit_per_ip_per_minute == 0 {
+        tracing::warn!(
+            "limits.rate_limit_per_ip_per_minute is 0 — nothing bounds how much Argon2 work an \
+             unauthenticated caller can trigger. Leave this on unless something in front of the \
+             proxy already limits by source address."
         );
     }
     for t in &cfg.tokens {
@@ -262,13 +282,17 @@ fn check_config(path: &Path) -> Result<()> {
     println!("  controller     {}", cfg.controller.host);
     println!(
         "  tls            {}",
-        match (
-            &cfg.controller.tls.fingerprint_sha256,
-            cfg.controller.tls.insecure_skip_verify
-        ) {
-            (Some(fp), _) => format!("pinned to {fp}"),
-            (None, true) => "INSECURE — certificate not verified".to_string(),
-            (None, false) => "standard WebPKI verification".to_string(),
+        if cfg.controller.is_plaintext() {
+            "NONE — plaintext http://, the API key travels unencrypted".to_string()
+        } else {
+            match (
+                &cfg.controller.tls.fingerprint_sha256,
+                cfg.controller.tls.insecure_skip_verify,
+            ) {
+                (Some(fp), _) => format!("pinned to {fp}"),
+                (None, true) => "INSECURE — certificate not verified".to_string(),
+                (None, false) => "standard WebPKI verification".to_string(),
+            }
         }
     );
     println!("  bind           {}", cfg.server.bind);
@@ -277,6 +301,13 @@ fn check_config(path: &Path) -> Result<()> {
         cfg.limits.max_vouchers_per_request,
         cfg.limits.max_validity_minutes,
         cfg.limits.rate_limit_per_minute
+    );
+    println!(
+        "  pre-auth       {}",
+        match cfg.limits.rate_limit_per_ip_per_minute {
+            0 => "UNLIMITED — an unauthenticated caller can spend Argon2 time freely".to_string(),
+            n => format!("{n} req/min per client IP"),
+        }
     );
     println!("\n  tokens ({}):", cfg.tokens.len());
     for t in &cfg.tokens {

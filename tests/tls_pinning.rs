@@ -101,6 +101,7 @@ async fn a_matching_fingerprint_is_accepted() {
             TlsConfig {
                 fingerprint_sha256: Some(console.fingerprint.clone()),
                 insecure_skip_verify: false,
+                allow_plaintext: false,
             },
         ),
         Duration::from_secs(5),
@@ -123,6 +124,7 @@ async fn a_different_certificate_is_refused() {
             TlsConfig {
                 fingerprint_sha256: Some(wrong),
                 insecure_skip_verify: false,
+                allow_plaintext: false,
             },
         ),
         Duration::from_secs(5),
@@ -156,6 +158,7 @@ async fn the_pin_survives_the_spellings_people_actually_paste() {
             TlsConfig {
                 fingerprint_sha256: Some(format!("sha256:{colonized}")),
                 insecure_skip_verify: false,
+                allow_plaintext: false,
             },
         ),
         Duration::from_secs(5),
@@ -175,6 +178,7 @@ async fn insecure_mode_connects_to_anything() {
             TlsConfig {
                 fingerprint_sha256: None,
                 insecure_skip_verify: true,
+                allow_plaintext: false,
             },
         ),
         Duration::from_secs(5),
@@ -232,6 +236,7 @@ async fn a_malformed_pin_is_rejected_at_construction() {
             TlsConfig {
                 fingerprint_sha256: Some("not-a-fingerprint".into()),
                 insecure_skip_verify: false,
+                allow_plaintext: false,
             },
         ),
         Duration::from_secs(1),
@@ -267,6 +272,7 @@ async fn pinning_works_over_tls_1_2_as_well() {
             TlsConfig {
                 fingerprint_sha256: Some(console.fingerprint.clone()),
                 insecure_skip_verify: false,
+                allow_plaintext: false,
             },
         ),
         Duration::from_secs(5),
@@ -289,6 +295,7 @@ async fn a_mismatch_is_caught_over_tls_1_2_too() {
             TlsConfig {
                 fingerprint_sha256: Some("c".repeat(64)),
                 insecure_skip_verify: false,
+                allow_plaintext: false,
             },
         ),
         Duration::from_secs(5),
@@ -312,6 +319,7 @@ async fn insecure_mode_also_works_over_tls_1_2() {
             TlsConfig {
                 fingerprint_sha256: None,
                 insecure_skip_verify: true,
+                allow_plaintext: false,
             },
         ),
         Duration::from_secs(5),

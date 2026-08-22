@@ -186,3 +186,128 @@ async fn a_plain_http_host_is_left_alone() {
         .await
         .is_ok());
 }
+
+#[tokio::test]
+async fn a_controller_server_error_does_not_leak_its_body_to_the_client() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "message": "NullPointerException at /usr/lib/unifi/internal/SiteService.java:412 (db=mongodb://10.0.0.9:27117)"
+        })))
+        .mount(&server)
+        .await;
+
+    let upstream = upstream_for(&server.uri(), Duration::from_secs(5));
+    let err = upstream.list_sites().await.unwrap_err();
+    let rendered = err.to_string();
+
+    // The operator gets the detail in the log; the client gets the status.
+    assert!(rendered.contains("500"), "{rendered}");
+    assert!(!rendered.contains("SiteService"), "{rendered}");
+    assert!(!rendered.contains("mongodb"), "{rendered}");
+    assert!(!rendered.contains("10.0.0.9"), "{rendered}");
+}
+
+#[tokio::test]
+async fn an_oversized_controller_message_is_cut_down_before_it_is_echoed() {
+    let server = MockServer::start().await;
+    let huge = "A".repeat(5000);
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({ "message": huge })))
+        .mount(&server)
+        .await;
+
+    let upstream = upstream_for(&server.uri(), Duration::from_secs(5));
+    let err = upstream.list_sites().await.unwrap_err();
+    let rendered = err.to_string();
+    assert!(
+        rendered.chars().count() < 300,
+        "a 5000-character upstream message must not become a 5000-character response: {} chars",
+        rendered.chars().count()
+    );
+    assert!(rendered.ends_with('…'), "{rendered}");
+}
+
+#[tokio::test]
+async fn control_characters_from_the_controller_cannot_forge_a_log_line() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "message": "bad request\n2026-01-01T00:00:00Z  INFO audit: token=admin outcome=ok"
+        })))
+        .mount(&server)
+        .await;
+
+    let upstream = upstream_for(&server.uri(), Duration::from_secs(5));
+    let err = upstream.list_sites().await.unwrap_err();
+    let rendered = err.to_string();
+    assert!(!rendered.contains('\n'), "{rendered:?}");
+    assert!(rendered.contains("bad request"), "{rendered}");
+}
+
+#[tokio::test]
+async fn a_rejected_key_stays_the_proxys_story_even_when_the_controller_tells_its_own() {
+    // The sibling test covers a bare 401. This is the case that was missing:
+    // the controller *does* send a message, and it talks about the proxy's
+    // credential rather than anything the caller did.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+            "message": "api key 8f3c9b2e is not valid for integration endpoints"
+        })))
+        .mount(&server)
+        .await;
+
+    let upstream = upstream_for(&server.uri(), Duration::from_secs(5));
+    let err = upstream.list_sites().await.unwrap_err();
+    let rendered = err.to_string();
+
+    assert!(
+        rendered.contains("rejected the proxy's API key"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("8f3c9b2e"),
+        "a fragment of the upstream key must never reach a client: {rendered}"
+    );
+    assert!(!rendered.contains("integration endpoints"), "{rendered}");
+}
+
+#[tokio::test]
+async fn a_forbidden_from_the_controller_is_framed_the_same_way() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "message": "key lacks the hotspot scope on site 66c2f1e9"
+        })))
+        .mount(&server)
+        .await;
+
+    let upstream = upstream_for(&server.uri(), Duration::from_secs(5));
+    let err = upstream.list_sites().await.unwrap_err();
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("rejected the proxy's API key"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("66c2f1e9"), "{rendered}");
+}
+
+#[tokio::test]
+async fn other_client_errors_keep_the_controllers_wording_because_it_is_actionable() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_json(json!({"message": "voucher not found"})),
+        )
+        .mount(&server)
+        .await;
+
+    let upstream = upstream_for(&server.uri(), Duration::from_secs(5));
+    let err = upstream
+        .delete_voucher("default", "abc123")
+        .await
+        .unwrap_err();
+    // A client can act on this one, so narrowing it would only cost debuggability.
+    assert!(err.to_string().contains("voucher not found"), "{err}");
+}

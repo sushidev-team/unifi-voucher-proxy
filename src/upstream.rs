@@ -110,16 +110,44 @@ impl Upstream {
             return Ok(json);
         }
 
-        let message = json
-            .get("message")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| match status {
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                    "the controller rejected the proxy's API key".to_string()
-                }
-                s => format!("controller request failed (HTTP {})", s.as_u16()),
-            });
+        // A 5xx body is where a controller would put internals — a stack trace,
+        // a path, a component name. That is the operator's to read in the log,
+        // not the client's to receive, so only the status crosses back.
+        let message = if status.is_server_error() {
+            // Resolved before the macro, as in `audit`: `tracing` only evaluates
+            // field expressions when a subscriber is listening, which makes them
+            // invisible to coverage.
+            let code = status.as_u16();
+            let body = clamp(&text);
+            tracing::warn!(
+                status = code,
+                body = %body,
+                "the controller returned a server error"
+            );
+            format!(
+                "the controller reported an error (HTTP {})",
+                status.as_u16()
+            )
+        } else if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            // Checked before the controller's own message, never after. A 401
+            // here is not about the caller's request at all — it says the
+            // *proxy's* key was refused. The caller can do nothing with that,
+            // and the controller's wording can describe the very secret this
+            // proxy exists to hold, so it goes to the operator's log instead.
+            let code = status.as_u16();
+            let body = clamp(&text);
+            tracing::warn!(
+                status = code,
+                body = %body,
+                "the controller rejected the proxy's API key"
+            );
+            "the controller rejected the proxy's API key".to_string()
+        } else {
+            json.get("message")
+                .and_then(Value::as_str)
+                .map(clamp)
+                .unwrap_or_else(|| format!("controller request failed (HTTP {})", status.as_u16()))
+        };
 
         Err(ProxyError::Upstream {
             status: axum::http::StatusCode::from_u16(status.as_u16())
@@ -158,6 +186,25 @@ fn short_reqwest_error(e: &reqwest::Error) -> String {
         return "connection refused or host unreachable".to_string();
     }
     "request failed".to_string()
+}
+
+/// Bounds a message coming from the controller before it is echoed anywhere.
+///
+/// Upstream text is not ours and is not trusted to be short or well-behaved:
+/// control characters are dropped so a log line cannot be forged, and the
+/// length is capped so a large body cannot become a large response or a large
+/// log entry.
+fn clamp(raw: &str) -> String {
+    const MAX: usize = 200;
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    match trimmed.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}…", &trimmed[..cut]),
+        None => trimmed.to_string(),
+    }
 }
 
 /// Turns a user-entered host into `https://host[:port]`.
