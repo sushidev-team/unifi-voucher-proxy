@@ -10,6 +10,21 @@ readme = "README.md"
 keywords = ["unifi", "ubiquiti", "voucher", "proxy", "hotspot"]
 categories = ["network-programming", "web-programming::http-server"]
 
+[features]
+# Builds the local fake controller. Off by default on purpose: `cargo build`
+# produces exactly one binary, so "what does this thing do" has one answer and
+# the release image carries no code that fabricates responses.
+testing = ["dep:rcgen", "dep:axum-server"]
+
+[[bin]]
+name = "unifi-voucher-proxy"
+path = "src/main.rs"
+
+[[bin]]
+name = "fake-controller"
+path = "src/bin/fake_controller.rs"
+required-features = ["testing"]
+
 [dependencies]
 axum = "0.8"
 async-graphql = { version = "7", default-features = false, features = ["graphiql"] }
@@ -39,6 +54,8 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 thiserror = "2"
 governor = "0.7"
+rcgen = { version = "0.13", optional = true }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"], optional = true }
 humantime-serde = "1"
 time = { version = "0.3", features = ["std", "parsing", "formatting", "serde-well-known", "macros"] }
 toml_edit = "0.22"
