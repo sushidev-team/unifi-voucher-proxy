@@ -38,6 +38,19 @@ pub struct ServerConfig {
     /// Largest request body accepted from a client, in bytes.
     #[serde(default = "default_body_limit")]
     pub max_body_bytes: usize,
+    /// Where to serve Prometheus metrics, on a listener of their own.
+    ///
+    /// Unset means the endpoint does not exist at all, which is the default:
+    /// the labels carry token names, and those are chosen to identify devices,
+    /// so the exposition is an inventory of the premises. Giving it its own
+    /// socket means the decision of who may read it is a bind address and a
+    /// published port, not another credential — and it keeps the client token
+    /// system to the four voucher scopes it has today.
+    ///
+    /// In a container, bind `0.0.0.0` here and publish it narrowly, e.g.
+    /// `127.0.0.1:9090:9090`, so it never faces the network the clients are on.
+    #[serde(default)]
+    pub metrics_bind: Option<SocketAddr>,
     /// Serve the GraphiQL explorer at `GET /graphql`.
     ///
     /// Off by default. The page is inert client-side HTML and carries no
@@ -108,11 +121,13 @@ fn one_or_many<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D
         One(String),
         Many(Vec<String>),
     }
-    Ok(match Option::<OneOrMany>::deserialize(d)? {
-        None => None,
-        Some(OneOrMany::One(s)) => Some(vec![s]),
-        Some(OneOrMany::Many(v)) => Some(v),
-    })
+    // `#[serde(default)]` on the field already handles a missing key, so this
+    // is only ever called for a value that is present: it has to describe the
+    // two shapes one can take, not the absence.
+    Ok(Some(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    }))
 }
 
 impl ControllerConfig {
@@ -293,6 +308,7 @@ impl Default for ServerConfig {
             bind: default_bind(),
             upstream_timeout: default_timeout(),
             max_body_bytes: default_body_limit(),
+            metrics_bind: None,
             graphql_playground: false,
         }
     }

@@ -34,8 +34,11 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # The library is where all the logic lives; main.rs is a thin CLI shell
-      # over it and is excluded so the number means something.
+      # The library is where all the logic lives. The binaries are excluded so
+      # the number means something: main.rs is a thin CLI shell over the lib,
+      # and src/bin/fake_controller.rs is a test fixture that exists to be
+      # driven by the end-to-end script, not by unit tests — counting it would
+      # measure the fixture instead of the proxy.
       #
       # The gate is 99, not 100, for one honest reason: `#[derive(InputObject)]`
       # on CreateVoucherInput generates a function with no reachable call site
@@ -47,7 +50,7 @@ jobs:
       - name: Measure
         run: |
           cargo llvm-cov --all-features --locked \
-            --ignore-filename-regex 'src/main\.rs' \
+            --ignore-filename-regex 'src/main\.rs|src/bin/' \
             --fail-under-lines 99 \
             --show-missing-lines \
             --lcov --output-path lcov.info

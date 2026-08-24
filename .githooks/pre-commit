@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# fmt, clippy and the tests — the three CI runs first, in CI's order.
+#
+# Caveat worth knowing: this checks the working tree, not the index. A partially
+# staged commit can therefore pass here and still be red in CI. `pre-push` is
+# the backstop, and `--no-verify` skips both when you know what you are doing.
+set -uo pipefail
+
+git diff --cached --name-only --diff-filter=ACMR \
+  | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^\.github/workflows/' || exit 0
+
+exec "$(git rev-parse --show-toplevel)/testing/check.sh"

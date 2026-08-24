@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use axum::extract::{ConnectInfo, FromRequestParts};
+use axum::extract::{ConnectInfo, FromRequestParts, MatchedPath};
 use axum::http::request::Parts;
 use time::OffsetDateTime;
 
@@ -175,7 +175,7 @@ impl FromRequestParts<SharedState> for Caller {
                 audit::rejected(parts.uri.path(), "ip_rate_limited", 429);
                 state
                     .metrics
-                    .record_request("-", parts.uri.path(), "ip_rate_limited");
+                    .record_request("-", matched_route(parts), "ip_rate_limited");
                 return Err(ProxyError::RateLimited);
             }
         }
@@ -184,7 +184,7 @@ impl FromRequestParts<SharedState> for Caller {
             audit::rejected(parts.uri.path(), "missing_token", 401);
             state
                 .metrics
-                .record_request("-", parts.uri.path(), "missing_token");
+                .record_request("-", matched_route(parts), "missing_token");
             return Err(ProxyError::Unauthorized);
         };
 
@@ -192,7 +192,7 @@ impl FromRequestParts<SharedState> for Caller {
             audit::rejected(parts.uri.path(), "unknown_token", 401);
             state
                 .metrics
-                .record_request("-", parts.uri.path(), "unknown_token");
+                .record_request("-", matched_route(parts), "unknown_token");
             return Err(ProxyError::Unauthorized);
         };
 
@@ -204,7 +204,7 @@ impl FromRequestParts<SharedState> for Caller {
                 audit::rejected(parts.uri.path(), "token_expired", 401);
                 state
                     .metrics
-                    .record_request(&token.name, parts.uri.path(), "token_expired");
+                    .record_request(&token.name, matched_route(parts), "token_expired");
                 return Err(ProxyError::TokenExpired(
                     expiry
                         .format(&time::format_description::well_known::Rfc3339)
@@ -219,4 +219,23 @@ impl FromRequestParts<SharedState> for Caller {
         };
         Ok(Caller { token, ceilings })
     }
+}
+
+/// The route pattern a request matched, e.g.
+/// `/proxy/network/integration/v1/sites/{site}/hotspot/vouchers`.
+///
+/// Deliberately not `uri.path()`. The raw path carries caller-chosen site and
+/// voucher ids, and three of the call sites below record *before* the caller is
+/// authenticated — so using it as a metrics label lets anyone who can reach the
+/// port grow the map by one entry per request, for as long as they care to. The
+/// route table has a handful of entries; that is the cardinality this label is
+/// supposed to have, and what [`Metrics`](crate::metrics::Metrics) documents.
+///
+/// The audit log keeps the real path: a log line is not a map, and knowing
+/// which site id someone probed is the point of an audit trail.
+fn matched_route(parts: &Parts) -> &str {
+    parts
+        .extensions
+        .get::<MatchedPath>()
+        .map_or("unmatched", MatchedPath::as_str)
 }

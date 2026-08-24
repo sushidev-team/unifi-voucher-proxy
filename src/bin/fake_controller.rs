@@ -109,7 +109,11 @@ impl Console {
             .get("x-api-key")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v == self.cfg.api_key);
-        if ok { Ok(()) } else { Err(unauthorized()) }
+        if ok {
+            Ok(())
+        } else {
+            Err(unauthorized())
+        }
     }
 
     async fn pause(&self) {
@@ -240,10 +244,8 @@ async fn main() -> anyhow::Result<()> {
 
     // A self-signed certificate, like every UniFi console ships with — so the
     // proxy's pinning is exercised here rather than only in unit tests.
-    let cert = rcgen::generate_simple_self_signed(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])?;
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
     let der = cert.cert.der().to_vec();
     let fingerprint = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&der));
 
@@ -285,11 +287,8 @@ async fn main() -> anyhow::Result<()> {
 
     axum_server::bind_rustls(
         bind,
-        axum_server::tls_rustls::RustlsConfig::from_der(
-            vec![der],
-            cert.key_pair.serialize_der(),
-        )
-        .await?,
+        axum_server::tls_rustls::RustlsConfig::from_der(vec![der], cert.key_pair.serialize_der())
+            .await?,
     )
     .serve(app.into_make_service())
     .await?;

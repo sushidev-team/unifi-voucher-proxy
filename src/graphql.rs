@@ -141,7 +141,11 @@ impl Query {
         caller.require_scope(Scope::SitesRead).map_err(to_gql)?;
         caller.charge(&live.rate, "graphql:sites").map_err(to_gql)?;
 
+        let up = std::time::Instant::now();
         let body = live.upstream.list_sites().await.map_err(to_gql)?;
+        state
+            .metrics
+            .record_upstream(up.elapsed().as_millis() as u64);
         Ok(Site::list(&body)
             .into_iter()
             .filter(|s| caller.token.allows_site(&s.id))
@@ -162,11 +166,15 @@ impl Query {
             .charge(&live.rate, "graphql:vouchers")
             .map_err(to_gql)?;
 
+        let up = std::time::Instant::now();
         let body = live
             .upstream
             .list_vouchers(&site_id)
             .await
             .map_err(to_gql)?;
+        state
+            .metrics
+            .record_upstream(up.elapsed().as_millis() as u64);
         Ok(Voucher::list(&body))
     }
 }
@@ -197,11 +205,18 @@ impl Mutation {
         let request: CreateVoucherRequest = input.into();
         request.enforce(caller.ceilings).map_err(to_gql)?;
 
+        let up = std::time::Instant::now();
         let body = live
             .upstream
             .create_vouchers(&site_id, &request.to_upstream_body().map_err(to_gql)?)
             .await
             .map_err(to_gql)?;
+        state
+            .metrics
+            .record_upstream(up.elapsed().as_millis() as u64);
+        state
+            .metrics
+            .record_vouchers_created(caller.name(), request.count);
         Ok(Voucher::list(&body))
     }
 
@@ -222,10 +237,14 @@ impl Mutation {
             .charge(&live.rate, "graphql:revokeVoucher")
             .map_err(to_gql)?;
 
+        let up = std::time::Instant::now();
         live.upstream
             .delete_voucher(&site_id, &voucher_id)
             .await
             .map_err(to_gql)?;
+        state
+            .metrics
+            .record_upstream(up.elapsed().as_millis() as u64);
         Ok(RevokeResult {
             id: voucher_id,
             revoked: true,

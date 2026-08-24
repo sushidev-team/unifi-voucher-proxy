@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# The full gate, coverage included. Roughly a minute and a half, which is the
+# right trade at push time: this is the last point before CI has an opinion, and
+# the coverage floor is the one that cannot be spotted by reading the diff.
+set -uo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+ZERO="0000000000000000000000000000000000000000"
+relevant=0
+
+# stdin: <local ref> <local sha> <remote ref> <remote sha>, one line per ref.
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ "$local_sha" = "$ZERO" ] && continue          # deleting a branch
+  if [ "$remote_sha" = "$ZERO" ]; then            # new branch: no range to diff
+    relevant=1
+    break
+  fi
+  if git diff --name-only "$remote_sha" "$local_sha" \
+     | grep -qE '\.rs$|^Cargo\.(toml|lock)$|^\.github/workflows/'; then
+    relevant=1
+    break
+  fi
+done
+
+[ "$relevant" -eq 1 ] || exit 0
+exec "$ROOT/testing/check.sh" --full

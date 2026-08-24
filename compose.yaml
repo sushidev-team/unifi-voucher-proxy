@@ -7,12 +7,15 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+      # Metrics stay on the host loopback — never the network the clients are on.
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./config.toml:/etc/unifi-voucher-proxy/config.toml:ro
     environment:
       # Keep the controller key out of the config file and out of your backups.
       UVP_CONTROLLER__API_KEY: ${UNIFI_API_KEY:?set UNIFI_API_KEY in .env}
       UVP_LOG_FORMAT: json
+      UVP_SERVER__METRICS_BIND: 0.0.0.0:9090
     # The process needs nothing but an outbound socket.
     read_only: true
     cap_drop: [ALL]

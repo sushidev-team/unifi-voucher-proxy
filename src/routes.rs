@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::extract::{Path, State};
@@ -64,6 +64,35 @@ pub fn router_with(state: SharedState, max_body_bytes: usize, playground: bool) 
         .with_state(state)
 }
 
+/// The metrics listener: one route, served on its own socket.
+///
+/// Deliberately not merged into the main router. See
+/// [`ServerConfig::metrics_bind`](crate::config::ServerConfig::metrics_bind)
+/// for why the reachability of this is a bind address rather than a token.
+pub fn metrics_router(state: SharedState) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics))
+        .fallback(not_found)
+        .with_state(state)
+}
+
+async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
+    let body = state
+        .metrics
+        .render(env!("CARGO_PKG_VERSION"), state.live().token_count);
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+}
+
+async fn not_found() -> ProxyError {
+    ProxyError::NotAllowed
+}
+
 /// Unauthenticated liveness probe. Reveals nothing about the controller.
 async fn healthz() -> Json<Value> {
     Json(json!({"status": "ok", "service": "unifi-voucher-proxy"}))
@@ -71,7 +100,8 @@ async fn healthz() -> Json<Value> {
 
 /// Tells an authenticated client what it is actually allowed to do, so a UI can
 /// hide controls instead of letting the user hit a 403.
-async fn info(caller: Caller) -> Json<Value> {
+async fn info(State(state): State<SharedState>, caller: Caller) -> Json<Value> {
+    state.metrics.record_request(caller.name(), "info", "ok");
     Json(json!({
         "service": "unifi-voucher-proxy",
         "version": env!("CARGO_PKG_VERSION"),
@@ -104,6 +134,15 @@ async fn graphql_handler(
         .execute(inner.data(state.clone()).data(caller.clone()))
         .await;
 
+    let outcome = if response.is_ok() {
+        "ok"
+    } else {
+        "graphql_errors"
+    };
+    state
+        .metrics
+        .record_request(caller.name(), "graphql", outcome);
+
     // The document itself is not logged: variables can carry guest names.
     AuditRecord {
         token: caller.name(),
@@ -112,11 +151,7 @@ async fn graphql_handler(
         target: Some(&shape),
         count: None,
         status: if response.is_ok() { 200 } else { 400 },
-        outcome: if response.is_ok() {
-            "ok"
-        } else {
-            "graphql_errors"
-        },
+        outcome,
         elapsed: started.elapsed(),
     }
     .emit();
@@ -125,7 +160,10 @@ async fn graphql_handler(
 }
 
 /// The schema as SDL, so a client can generate types without introspection.
-async fn graphql_sdl(_caller: Caller) -> impl IntoResponse {
+async fn graphql_sdl(State(state): State<SharedState>, caller: Caller) -> impl IntoResponse {
+    state
+        .metrics
+        .record_request(caller.name(), "graphql:schema", "ok");
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -147,12 +185,32 @@ async fn not_allowed(method: axum::http::Method, uri: axum::http::Uri) -> ProxyE
 async fn list_sites(State(state): State<SharedState>, caller: Caller) -> ProxyResult<Json<Value>> {
     let started = Instant::now();
     let live = state.live();
-    caller.require_scope(Scope::SitesRead)?;
-    caller.charge(&live.rate, "sites:list")?;
+    let mut upstream = Duration::ZERO;
 
-    let result = live.upstream.list_sites().await;
-    let filtered = result.map(|body| filter_sites(body, &caller));
-    finish(&caller, "sites:list", None, None, None, started, filtered)
+    // Every exit runs through `finish`, including the refusals. A `?` here
+    // would return before the record is written, and a proxy that logs only
+    // what it allowed answers half the question it exists to answer.
+    let result = async {
+        caller.require_scope(Scope::SitesRead)?;
+        caller.charge(&live.rate, "sites:list")?;
+        let up = Instant::now();
+        let body = live.upstream.list_sites().await;
+        upstream = up.elapsed();
+        body.map(|b| filter_sites(b, &caller))
+    }
+    .await;
+
+    finish(
+        &state,
+        &caller,
+        "sites:list",
+        None,
+        None,
+        None,
+        started,
+        upstream,
+        result,
+    )
 }
 
 /// A token scoped to specific sites must not learn that other sites exist.
@@ -182,18 +240,28 @@ async fn list_vouchers(
 ) -> ProxyResult<Json<Value>> {
     let started = Instant::now();
     let live = state.live();
-    caller.require_scope(Scope::VouchersRead)?;
-    caller.require_site(&site)?;
-    caller.charge(&live.rate, "vouchers:list")?;
+    let mut upstream = Duration::ZERO;
 
-    let result = live.upstream.list_vouchers(&site).await;
+    let result = async {
+        caller.require_scope(Scope::VouchersRead)?;
+        caller.require_site(&site)?;
+        caller.charge(&live.rate, "vouchers:list")?;
+        let up = Instant::now();
+        let body = live.upstream.list_vouchers(&site).await;
+        upstream = up.elapsed();
+        body
+    }
+    .await;
+
     finish(
+        &state,
         &caller,
         "vouchers:list",
         Some(&site),
         None,
         None,
         started,
+        upstream,
         result,
     )
 }
@@ -206,28 +274,41 @@ async fn create_vouchers(
 ) -> ProxyResult<Json<Value>> {
     let started = Instant::now();
     let live = state.live();
-    caller.require_scope(Scope::VouchersCreate)?;
-    caller.require_site(&site)?;
-    // Charged before the body is looked at, not after. Scope and site are fixed
-    // lookups a caller cannot make expensive; parsing and policy work on data
-    // the caller controls, so a client that only ever sends rejects would
-    // otherwise get that work for free.
-    caller.charge(&live.rate, "vouchers:create")?;
+    let mut upstream = Duration::ZERO;
+    let mut count = None;
 
-    let request = CreateVoucherRequest::parse(&body)?;
-    request.enforce(caller.ceilings)?;
+    let result = async {
+        caller.require_scope(Scope::VouchersCreate)?;
+        caller.require_site(&site)?;
+        // Charged before the body is looked at, not after. Scope and site are
+        // fixed lookups a caller cannot make expensive; parsing and policy work
+        // on data the caller controls, so a client that only ever sends rejects
+        // would otherwise get that work for free.
+        caller.charge(&live.rate, "vouchers:create")?;
 
-    let result = live
-        .upstream
-        .create_vouchers(&site, &request.to_upstream_body()?)
-        .await;
+        let request = CreateVoucherRequest::parse(&body)?;
+        request.enforce(caller.ceilings)?;
+        count = Some(request.count);
+
+        let up = Instant::now();
+        let created = live
+            .upstream
+            .create_vouchers(&site, &request.to_upstream_body()?)
+            .await;
+        upstream = up.elapsed();
+        created
+    }
+    .await;
+
     finish(
+        &state,
         &caller,
         "vouchers:create",
         Some(&site),
         None,
-        Some(request.count),
+        count,
         started,
+        upstream,
         result,
     )
 }
@@ -239,36 +320,60 @@ async fn delete_voucher(
 ) -> ProxyResult<Json<Value>> {
     let started = Instant::now();
     let live = state.live();
-    caller.require_scope(Scope::VouchersRevoke)?;
-    caller.require_site(&site)?;
-    caller.charge(&live.rate, "vouchers:revoke")?;
+    let mut upstream = Duration::ZERO;
 
-    let result = live.upstream.delete_voucher(&site, &voucher).await;
+    let result = async {
+        caller.require_scope(Scope::VouchersRevoke)?;
+        caller.require_site(&site)?;
+        caller.charge(&live.rate, "vouchers:revoke")?;
+        let up = Instant::now();
+        let deleted = live.upstream.delete_voucher(&site, &voucher).await;
+        upstream = up.elapsed();
+        deleted
+    }
+    .await;
+
     finish(
+        &state,
         &caller,
         "vouchers:revoke",
         Some(&site),
         Some(&voucher),
         None,
         started,
+        upstream,
         result,
     )
 }
 
 /// Emits the audit record for a completed operation and shapes the response.
+#[allow(clippy::too_many_arguments)]
 fn finish(
+    state: &SharedState,
     caller: &Caller,
     action: &str,
     site: Option<&str>,
     target: Option<&str>,
     count: Option<u32>,
     started: Instant,
+    upstream: Duration,
     result: ProxyResult<Value>,
 ) -> ProxyResult<Json<Value>> {
     let (status, outcome) = match &result {
         Ok(_) => (200, "ok".to_string()),
         Err(e) => (e.status().as_u16(), e.kind().to_string()),
     };
+    // Both surfaces are fed from one place, so an outcome cannot appear in the
+    // audit log and be missing from the counters.
+    state
+        .metrics
+        .record_request(caller.name(), action, &outcome);
+    state.metrics.record_upstream(upstream.as_millis() as u64);
+    if result.is_ok() {
+        if let Some(n) = count {
+            state.metrics.record_vouchers_created(caller.name(), n);
+        }
+    }
     AuditRecord {
         token: caller.name(),
         action,

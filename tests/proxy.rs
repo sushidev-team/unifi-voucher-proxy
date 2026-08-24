@@ -24,6 +24,8 @@ struct Harness {
     server: TestServer,
     token: String,
     upstream: MockServer,
+    /// Kept so tests can read what the proxy recorded, not just what it replied.
+    state: unifi_voucher_proxy::state::SharedState,
 }
 
 /// Builds a proxy wired to a stub controller. `tokens` describes the callers.
@@ -65,11 +67,12 @@ async fn harness(build: impl FnOnce(&mut TokenConfig)) -> Harness {
     };
 
     let state = AppState::new(&cfg).unwrap();
-    let app = routes::router(state, cfg.server.max_body_bytes);
+    let app = routes::router(state.clone(), cfg.server.max_body_bytes);
     Harness {
         server: TestServer::new(app).unwrap(),
         token,
         upstream,
+        state,
     }
 }
 
@@ -721,4 +724,175 @@ async fn a_scope_refusal_is_free_because_the_caller_cannot_make_it_expensive() {
         .add_header("authorization", format!("Bearer {}", h.token))
         .await
         .assert_status_ok();
+}
+
+// --- metrics cardinality ----------------------------------------------------
+
+#[tokio::test]
+async fn caller_chosen_path_segments_cannot_grow_the_metrics_map() {
+    let h = default_harness().await;
+
+    // Unauthenticated, and each request names a different site. Before the
+    // label was switched to the matched route, every one of these added a
+    // permanent entry to the metrics map — an unauthenticated memory leak.
+    for i in 0..50 {
+        h.server
+            .get(&format!("{API}/sites/site-{i}/hotspot/vouchers"))
+            .await
+            .assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    let rendered = h.state.metrics.render("test", 1);
+    let lines = rendered
+        .lines()
+        .filter(|l| l.starts_with("uvp_requests_total{"))
+        .count();
+    assert_eq!(
+        lines, 1,
+        "50 distinct site ids must collapse onto one route label, got:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("action=\"/proxy/network/integration/v1/sites/{site}/hotspot/vouchers\""),
+        "{rendered}"
+    );
+    // The concrete ids must not appear at all.
+    assert!(!rendered.contains("site-7"), "{rendered}");
+}
+
+// --- the metrics listener ---------------------------------------------------
+
+#[tokio::test]
+async fn the_metrics_endpoint_reports_what_the_proxy_recorded() {
+    let h = default_harness().await;
+    let metrics = TestServer::new(routes::metrics_router(h.state.clone())).unwrap();
+
+    h.server
+        .get("/proxy/info")
+        .add_header("authorization", format!("Bearer {}", h.token))
+        .await
+        .assert_status_ok();
+
+    let res = metrics.get("/metrics").await;
+    res.assert_status_ok();
+    let body = res.text();
+    assert!(body.contains("uvp_build_info"), "{body}");
+    assert!(body.contains("uvp_tokens_configured 1"), "{body}");
+    assert_eq!(
+        res.header("content-type"),
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+}
+
+#[tokio::test]
+async fn the_metrics_listener_serves_nothing_but_metrics() {
+    let h = default_harness().await;
+    let metrics = TestServer::new(routes::metrics_router(h.state.clone())).unwrap();
+
+    // It is a second socket on purpose; it must not become a second way into
+    // the proxy. Nothing from the main router is reachable here.
+    for path in ["/healthz", "/proxy/info", "/graphql", API] {
+        metrics
+            .get(path)
+            .await
+            .assert_status(axum::http::StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
+async fn metrics_never_carry_a_token_value_only_its_name() {
+    let h = default_harness().await;
+    let metrics = TestServer::new(routes::metrics_router(h.state.clone())).unwrap();
+
+    h.server
+        .get("/proxy/info")
+        .add_header("authorization", format!("Bearer {}", h.token))
+        .await;
+    // A wrong token must not end up as a label either.
+    h.server
+        .get("/proxy/info")
+        .add_header("authorization", "Bearer uvp_definitely_wrong")
+        .await;
+
+    let body = metrics.get("/metrics").await.text();
+    assert!(
+        body.contains("test-client"),
+        "the name is the label: {body}"
+    );
+    assert!(!body.contains(&h.token), "the secret is not: {body}");
+    assert!(!body.contains("uvp_definitely_wrong"), "{body}");
+}
+
+#[tokio::test]
+async fn every_metric_the_module_exposes_is_actually_fed() {
+    let h = default_harness().await;
+    let metrics = TestServer::new(routes::metrics_router(h.state.clone())).unwrap();
+
+    Mock::given(method("POST"))
+        .and(path(format!("{API}/sites/default/hotspot/vouchers")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+        .mount(&h.upstream)
+        .await;
+
+    h.server
+        .post(&format!("{API}/sites/default/hotspot/vouchers"))
+        .add_header("authorization", format!("Bearer {}", h.token))
+        .json(&json!({"name": "Guest", "count": 3, "timeLimitMinutes": 60}))
+        .await
+        .assert_status_ok();
+
+    let body = metrics.get("/metrics").await.text();
+
+    // Three of these used to render as permanent zeroes because nothing called
+    // their recorder — an endpoint reporting that would be worse than none.
+    assert!(
+        body.contains(
+            r#"uvp_requests_total{token="test-client",action="vouchers:create",outcome="ok"} 1"#
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"uvp_vouchers_created_total{token="test-client"} 3"#),
+        "vouchers created must count the vouchers, not the requests: {body}"
+    );
+    assert!(body.contains("uvp_upstream_calls_total 1"), "{body}");
+    assert!(!body.contains("uvp_upstream_calls_total 0"), "{body}");
+}
+
+#[tokio::test]
+async fn a_refused_request_counts_as_refused_not_as_a_voucher() {
+    let h = harness(|t| t.max_vouchers_per_request = Some(1)).await;
+    let metrics = TestServer::new(routes::metrics_router(h.state.clone())).unwrap();
+
+    h.server
+        .post(&format!("{API}/sites/default/hotspot/vouchers"))
+        .add_header("authorization", format!("Bearer {}", h.token))
+        .json(&json!({"name": "Guest", "count": 50, "timeLimitMinutes": 60}))
+        .await
+        .assert_status(axum::http::StatusCode::FORBIDDEN);
+
+    let body = metrics.get("/metrics").await.text();
+    assert!(body.contains(r#"outcome="forbidden"#), "{body}");
+    // The ceiling stopped it before the controller, so nothing was issued.
+    assert!(!body.contains("uvp_vouchers_created_total{"), "{body}");
+}
+
+#[tokio::test]
+async fn a_policy_refusal_leaves_an_audit_record() {
+    let h = harness(|t| t.scopes = vec![Scope::SitesRead]).await;
+    let metrics = TestServer::new(routes::metrics_router(h.state.clone())).unwrap();
+
+    h.server
+        .post(&format!("{API}/sites/default/hotspot/vouchers"))
+        .add_header("authorization", format!("Bearer {}", h.token))
+        .json(&json!({"name": "Guest", "count": 1, "timeLimitMinutes": 60}))
+        .await
+        .assert_status(axum::http::StatusCode::FORBIDDEN);
+
+    // "What did that app actually do to my controller" has to include the
+    // things it was stopped from doing.
+    let body = metrics.get("/metrics").await.text();
+    assert!(
+        body.contains(r#"action="vouchers:create",outcome="forbidden""#),
+        "{body}"
+    );
 }

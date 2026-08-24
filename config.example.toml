@@ -10,6 +10,25 @@ bind = "0.0.0.0:8080"
 upstream_timeout = "15s"
 max_body_bytes = 65536
 
+# Serve the GraphiQL explorer at GET /graphql. Off by default: the page is inert
+# client-side HTML and carries no credentials, but a security component should
+# not put an unrequested interactive console on the network.
+# graphql_playground = false
+
+# Prometheus metrics, on a listener of their own. Unset means the endpoint does
+# not exist at all, which is the default.
+#
+# It gets its own socket rather than a path on the main port because the labels
+# carry token names, and those are chosen to identify devices — so the output is
+# an inventory of the premises and of who does what. Keeping it on a separate
+# bind means "who may read this" is a published port rather than another
+# credential, and the client tokens stay limited to the four voucher scopes.
+#
+# In a container, bind 0.0.0.0 here and publish it narrowly:
+#     ports:
+#       - "127.0.0.1:9090:9090"
+# metrics_bind = "0.0.0.0:9090"
+
 [controller]
 # Your UniFi console. Scheme optional.
 host = "192.168.1.1"
@@ -77,6 +96,12 @@ hash = "$argon2id$v=19$m=19456,t=2,p=1$REPLACE_ME"
 # that the others exist.
 sites = ["*"]
 scopes = ["sites:read", "vouchers:read", "vouchers:create", "vouchers:revoke"]
+
+# Optional deadline, RFC 3339. Checked on every request rather than at startup,
+# so a long-running proxy stops honouring the token the moment it lapses — no
+# restart needed. The instant itself already counts as expired.
+# expires_at = "2027-01-01T00:00:00Z"
+
 # Optional per-token tightening:
 # max_vouchers_per_request = 5
 # max_validity_minutes = 1440

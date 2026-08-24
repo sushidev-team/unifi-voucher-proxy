@@ -113,9 +113,12 @@ async fn serve(path: &Path) -> Result<()> {
     let cfg = Config::load(Some(path))?;
     warn_about_weak_settings(&cfg);
 
-    let state = AppState::new(&cfg)?;
+    // Built with the path, not without: `reload` re-reads this file on SIGHUP,
+    // and there is nothing to re-read if the state does not remember where it
+    // came from.
+    let state = AppState::with_path(&cfg, Some(path.to_path_buf()))?;
     let app = routes::router_with(
-        state,
+        state.clone(),
         cfg.server.max_body_bytes,
         cfg.server.graphql_playground,
     );
@@ -123,6 +126,26 @@ async fn serve(path: &Path) -> Result<()> {
     let listener = TcpListener::bind(cfg.server.bind)
         .await
         .with_context(|| format!("cannot bind {}", cfg.server.bind))?;
+
+    // Metrics get a socket of their own so that who may read them is a bind
+    // address rather than another credential. Absent config, they do not exist.
+    if let Some(addr) = cfg.server.metrics_bind {
+        let metrics_listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("cannot bind {addr} for metrics"))?;
+        let metrics_app = routes::metrics_router(state.clone());
+        tracing::info!(bind = %addr, "metrics listening");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(metrics_listener, metrics_app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+            {
+                tracing::error!("metrics listener stopped: {e}");
+            }
+        });
+    }
+
+    spawn_reload_on_sighup(state.clone());
 
     tracing::info!(
         bind = %cfg.server.bind,
@@ -334,6 +357,43 @@ fn check_config(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// Re-reads the config file on SIGHUP.
+///
+/// The conventional signal for "pick up the new configuration" on a long-lived
+/// daemon, and the reason [`AppState::reload`] exists: a token can be added or
+/// revoked without dropping the connections of the ones that still work. A
+/// rejected config leaves the running one in place, so a typo costs a log line
+/// rather than the service.
+#[cfg(unix)]
+fn spawn_reload_on_sighup(state: unifi_voucher_proxy::state::SharedState) {
+    tokio::spawn(async move {
+        let mut hup = match signal::unix::signal(signal::unix::SignalKind::hangup()) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("cannot listen for SIGHUP, config reload is unavailable: {e}");
+                return;
+            }
+        };
+        while hup.recv().await.is_some() {
+            match state.reload() {
+                Ok(tokens) => {
+                    state.metrics.record_reload(true);
+                    tracing::info!(tokens, "config reloaded on SIGHUP");
+                }
+                Err(e) => {
+                    state.metrics.record_reload(false);
+                    tracing::error!(
+                        "config reload rejected, still serving the previous one: {e:#}"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_reload_on_sighup(_state: unifi_voucher_proxy::state::SharedState) {}
 
 async fn shutdown_signal() {
     let ctrl_c = async {
