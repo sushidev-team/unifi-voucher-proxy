@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/sushidev-team/unifi-voucher-proxy/compare/v0.1.0...v0.1.1) (2026-08-24)
+
+
+### Bug Fixes
+
+* issues + rate limit issues ([2d48f89](https://github.com/sushidev-team/unifi-voucher-proxy/commit/2d48f89921468d96e2b5e3e5d6ed9ac58b7f1272))
+
 ## 0.1.0 (2026-08-22)
 
 

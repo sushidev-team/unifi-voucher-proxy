@@ -1,6 +1,6 @@
 [package]
 name = "unifi-voucher-proxy"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 description = "A scoped, auditable proxy for the UniFi Network Integration API. Holds your full-control API key so apps never see it."
